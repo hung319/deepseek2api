@@ -289,18 +289,20 @@ async def list_models():
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
     session = session_manager.get_session()
-    request_id = str(uuid.uuid4())[:8] # ID ngắn để trace log
+    request_id = str(uuid.uuid4())[:8]
     
     logger.info(f"[{request_id}] 🚀 New Chat Request. Model: {req.model}")
 
     headers = {
         "Authorization": f"Bearer {session['token']}",
-        "User-Agent": session['user_agent'],
+        "User-Agent": session['user_agent'], # Đây là UA của Chrome 120
         "Content-Type": "application/json",
-        "X-App-Version": "20240125.0",
         "Accept": "*/*"
+        # Đã bỏ X-App-Version để tránh bị lộ là bot
     }
-    IMPERSONATE = "safari15_3"
+    
+    # --- FIX: Đổi sang chrome120 để khớp với User-Agent ---
+    IMPERSONATE = "chrome120"
 
     # --- 1. PoW & Challenge ---
     try:
@@ -314,7 +316,7 @@ async def chat_completions(req: ChatCompletionRequest):
         if pow_req.status_code == 200:
             c_data = pow_req.json().get("data", {}).get("biz_data", {}).get("challenge")
             if c_data:
-                logger.info(f"[{request_id}] 🧩 Solving PoW Challenge...")
+                logger.info(f"[{request_id}] 🧩 Solving PoW...")
                 ans = pow_manager.compute_answer(
                     c_data["challenge"], c_data["salt"], 
                     c_data["difficulty"], c_data["expire_at"]
@@ -331,8 +333,6 @@ async def chat_completions(req: ChatCompletionRequest):
                     pow_str = base64.b64encode(json.dumps(resp_json).encode()).decode().rstrip()
                     headers["x-ds-pow-response"] = pow_str
                     logger.info(f"[{request_id}] ✅ PoW Solved.")
-                else:
-                    logger.warning(f"[{request_id}] ⚠️ PoW Solve Failed!")
     except Exception as e:
         logger.warning(f"[{request_id}] PoW Error: {e}")
 
@@ -345,19 +345,18 @@ async def chat_completions(req: ChatCompletionRequest):
             proxies={"https": Config.PROXY} if Config.PROXY else None,
             timeout=30
         )
-        if s_resp.status_code == 200:
-            chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
-            logger.info(f"[{request_id}] 🆔 Session Created: {chat_session_id}")
+        # Log response nếu lỗi
+        if s_resp.status_code != 200:
+             logger.error(f"[{request_id}] ❌ Session Create Failed: {s_resp.status_code} {s_resp.text[:200]}")
         else:
-            logger.error(f"[{request_id}] ❌ Session Create Failed: {s_resp.text}")
+             chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
+             logger.info(f"[{request_id}] 🆔 Session: {chat_session_id}")
     except Exception as e:
         logger.error(f"[{request_id}] Session Create Exception: {e}")
 
     # --- 3. Payload ---
     final_prompt = messages_prepare(req.messages)
-    # Log 100 ký tự đầu của prompt để debug format
-    logger.info(f"[{request_id}] 📝 Prompt Preview: {final_prompt[:100]}...")
-
+    
     thinking_enabled = False
     if "reasoner" in req.model or "r1" in req.model:
         thinking_enabled = True
@@ -374,43 +373,32 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # --- 4. Request Upstream ---
     try:
-        logger.info(f"[{request_id}] 📡 Sending request to DeepSeek...")
         r = requests.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
             json=payload, headers=headers, impersonate=IMPERSONATE, stream=True,
             proxies={"https": Config.PROXY} if Config.PROXY else None,
             timeout=120
         )
-        logger.info(f"[{request_id}] 🔙 Response Status: {r.status_code}")
         
         if r.status_code != 200:
-            logger.error(f"[{request_id}] ❌ Error Body: {r.text}")
-            raise HTTPException(r.status_code, f"Upstream Error: {r.text}")
+            logger.error(f"[{request_id}] ❌ Chat Failed: {r.status_code} {r.text[:200]}")
+            raise HTTPException(r.status_code, f"DeepSeek Error: {r.text[:200]}")
 
     except Exception as e:
-        logger.error(f"[{request_id}] 💥 Connection Failed: {e}")
-        raise HTTPException(502, f"Upstream connect error: {e}")
+        raise HTTPException(502, f"Connection Error: {e}")
 
-    # --- 5. Stream Converter (DEBUG MODE) ---
+    # --- 5. Stream Converter ---
     async def openai_stream():
         chat_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
-        line_count = 0
         
         for line in r.iter_lines():
             if not line: continue
             line = line.decode('utf-8')
-            
-            # LOG 10 dòng đầu tiên để soi dữ liệu
-            line_count += 1
-            if line_count <= 10:
-                logger.info(f"[{request_id}] 📥 Stream Line {line_count}: {line}")
-
             if not line.startswith("data: "): continue
             
             txt = line[6:].strip()
             if txt == "[DONE]":
-                logger.info(f"[{request_id}] ✅ Stream DONE received.")
                 yield "data: [DONE]\n\n"
                 break
             
@@ -418,24 +406,19 @@ async def chat_completions(req: ChatCompletionRequest):
                 chunk = json.loads(txt)
                 content = ""
                 
-                # Logic Parse
+                # Logic Parse đa năng
                 if "choices" in chunk:
                     choice = chunk["choices"][0]
                     if choice.get("finish_reason") == "backend_busy":
                         content = " [Server Busy] "
-                        logger.warning(f"[{request_id}] ⚠️ Server Busy Signal")
                     else:
                         content = choice.get("delta", {}).get("content", "")
                 
                 elif "v" in chunk:
                     v_val = chunk.get("v")
-                    p_val = chunk.get("p")
                     if isinstance(v_val, str):
                         content = v_val
-                        # Log nếu nhận được text thật
-                        if line_count <= 20: 
-                             logger.info(f"[{request_id}] 🎯 Parsed Content: {content[:20]}...")
-                
+
                 if content:
                     resp_chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
@@ -443,16 +426,12 @@ async def chat_completions(req: ChatCompletionRequest):
                         "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(resp_chunk)}\n\n"
-                    
-            except Exception as e:
-                logger.error(f"[{request_id}] ⚠️ Parse Error: {e} | Line: {line}")
+            except:
                 continue
 
     if req.stream:
         return StreamingResponse(openai_stream(), media_type="text/event-stream")
     
-    # Non-stream
-    logger.info(f"[{request_id}] ⚠️ Client requested non-stream mode (simulated)")
     full_text = ""
     async for chunk in openai_stream():
         if "[DONE]" in chunk: break
