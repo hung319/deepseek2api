@@ -1,8 +1,6 @@
 fastapi
 uvicorn
 curl_cffi
-transformers
 wasmtime
-jinja2
 python-dotenv
 pydantic
