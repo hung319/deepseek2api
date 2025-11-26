@@ -7,6 +7,9 @@ import re
 import struct
 import time
 import os
+import queue
+import threading
+import uuid
 from dotenv import load_dotenv
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request, Depends, Security
@@ -37,7 +40,6 @@ logger = logging.getLogger("DeepSeek-Proxy")
 
 app = FastAPI(docs_url=None, redoc_url=None)
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,14 +50,12 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# -------------------------- Helper Token Count (Thay thế Transformers) --------------------------
+# -------------------------- Helper Token Count --------------------------
 def estimate_tokens(text: str) -> int:
-    """Ước lượng số token (quy tắc ngón tay cái: 4 ký tự ~ 1 token)"""
-    if not text:
-        return 0
+    if not text: return 0
     return len(text) // 4
 
-# -------------------------- Quản lý tài khoản Global --------------------------
+# -------------------------- Quản lý tài khoản --------------------------
 account_queue = []
 
 def init_account_queue():
@@ -77,23 +77,25 @@ DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/crea
 DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_challenge"
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 
+# Cập nhật Header theo request mẫu của bạn (App v1.5.0)
 BASE_HEADERS = {
     "Host": DEEPSEEK_HOST,
-    "User-Agent": "DeepSeek/1.0.13 Android/35",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
     "Accept": "application/json",
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
-    "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
-    "x-client-locale": "zh_CN",
+    "x-client-platform": "web",
+    "x-client-version": "1.5.0", # Cập nhật version mới
+    "x-client-locale": "en_US",
     "accept-charset": "UTF-8",
+    "origin": f"https://{DEEPSEEK_HOST}",
+    "referer": f"https://{DEEPSEEK_HOST}/"
 }
 
 WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm"
 KEEP_ALIVE_TIMEOUT = 5
 
-# -------------------------- Helper Functions --------------------------
-
+# -------------------------- Auth & Proxy Helpers --------------------------
 def get_proxy_kwargs():
     if PROXY_URL:
         return {"proxies": {"http": PROXY_URL, "https": PROXY_URL}}
@@ -109,8 +111,7 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security
 def get_account_identifier(account):
     return account.get("email", "").strip() or account.get("mobile", "").strip()
 
-# -------------------------- Logic Login & Account --------------------------
-
+# -------------------------- Logic DeepSeek --------------------------
 def login_deepseek_via_account(account):
     email = account.get("email", "").strip()
     mobile = account.get("mobile", "").strip()
@@ -124,7 +125,6 @@ def login_deepseek_via_account(account):
         "device_id": "deepseek_to_api",
         "os": "android"
     }
-    
     if email:
         payload["email"] = email
     else:
@@ -133,76 +133,50 @@ def login_deepseek_via_account(account):
 
     try:
         resp = requests.post(
-            DEEPSEEK_LOGIN_URL, 
-            headers=BASE_HEADERS, 
-            json=payload, 
-            impersonate="safari15_3",
-            **get_proxy_kwargs()
+            DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="safari15_3", **get_proxy_kwargs()
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception as e:
-        logger.error(f"[Login] Lỗi login: {e}")
-        raise HTTPException(status_code=500, detail="Login failed upstream")
-
-    try:
         new_token = data["data"]["biz_data"]["user"]["token"]
         account["token"] = new_token
         return new_token
     except Exception as e:
-        logger.error(f"[Login] Parse response failed: {data}")
-        raise HTTPException(status_code=500, detail="Invalid login response")
-
-def choose_account(exclude_ids=None):
-    if exclude_ids is None:
-        exclude_ids = []
-    
-    for i in range(len(account_queue)):
-        acc = account_queue[i]
-        acc_id = get_account_identifier(acc)
-        if acc_id and acc_id not in exclude_ids:
-            account_queue.pop(i)
-            account_queue.append(acc)
-            return acc
-            
-    logger.warning("[Account] No available accounts")
-    return None
+        logger.error(f"[Login] Failed: {e}")
+        raise HTTPException(status_code=500, detail="Login failed upstream")
 
 def get_valid_token(request: Request):
     if not hasattr(request.state, "tried_accounts"):
         request.state.tried_accounts = []
-        
-    account = choose_account(request.state.tried_accounts)
-    if not account:
-         raise HTTPException(status_code=429, detail="No accounts available or all busy.")
     
+    available_accounts = [acc for acc in account_queue if get_account_identifier(acc) not in request.state.tried_accounts]
+    if not available_accounts:
+         request.state.tried_accounts = []
+         available_accounts = account_queue
+    
+    if not available_accounts:
+        raise HTTPException(status_code=429, detail="No accounts configured.")
+
+    account = available_accounts[0]
     request.state.account = account
     request.state.tried_accounts.append(get_account_identifier(account))
     
     token = account.get("token")
     if not token:
         token = login_deepseek_via_account(account)
-    
     return token
 
 def get_auth_headers(token):
     return {**BASE_HEADERS, "authorization": f"Bearer {token}"}
 
-# -------------------------- PoW & WASM --------------------------
+# -------------------------- PoW Calculation --------------------------
 def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, signature, target_path, wasm_path):
-    if algorithm != "DeepSeekHashV1":
-        return None
-        
+    if algorithm != "DeepSeekHashV1": return None
     prefix = f"{salt}_{expire_at}_"
     store = Store()
     linker = Linker(store.engine)
-    
     try:
-        with open(wasm_path, "rb") as f:
-            wasm_bytes = f.read()
-    except Exception as e:
-        logger.error(f"WASM load error: {e}")
-        return None
+        with open(wasm_path, "rb") as f: wasm_bytes = f.read()
+    except: return None
         
     module = Module(store.engine, wasm_bytes)
     instance = linker.instantiate(store, module)
@@ -213,87 +187,62 @@ def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, si
     alloc = exports["__wbindgen_export_0"]
     wasm_solve = exports["wasm_solve"]
 
-    def write_memory(offset, data):
-        base_addr = ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value
-        ctypes.memmove(base_addr + offset, data, len(data))
+    def write_mem(offset, data):
+        ctypes.memmove(ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value + offset, data, len(data))
 
-    def read_memory(offset, size):
-        base_addr = ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value
-        return ctypes.string_at(base_addr + offset, size)
+    def read_mem(offset, size):
+        return ctypes.string_at(ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value + offset, size)
 
-    def encode_string(text):
+    def encode(text):
         data = text.encode("utf-8")
-        length = len(data)
-        ptr_val = alloc(store, length, 1)
-        ptr = int(ptr_val.value) if hasattr(ptr_val, "value") else int(ptr_val)
-        write_memory(ptr, data)
-        return ptr, length
+        ptr = int(alloc(store, len(data), 1))
+        write_mem(ptr, data)
+        return ptr, len(data)
 
     retptr = add_to_stack(store, -16)
-    ptr_challenge, len_challenge = encode_string(challenge_str)
-    ptr_prefix, len_prefix = encode_string(prefix)
+    ptr_c, len_c = encode(challenge_str)
+    ptr_p, len_p = encode(prefix)
+    wasm_solve(store, retptr, ptr_c, len_c, ptr_p, len_p, float(difficulty))
     
-    wasm_solve(store, retptr, ptr_challenge, len_challenge, ptr_prefix, len_prefix, float(difficulty))
-    
-    status = struct.unpack("<i", read_memory(retptr, 4))[0]
-    value = struct.unpack("<d", read_memory(retptr + 8, 8))[0]
+    status = struct.unpack("<i", read_mem(retptr, 4))[0]
+    val = struct.unpack("<d", read_mem(retptr + 8, 8))[0]
     add_to_stack(store, 16)
-    
-    return int(value) if status != 0 else None
+    return int(val) if status != 0 else None
 
-def get_pow_response(token, max_attempts=3):
+def get_pow_response(token):
     headers = get_auth_headers(token)
-    for _ in range(max_attempts):
+    for _ in range(3):
         try:
             resp = requests.post(
-                DEEPSEEK_CREATE_POW_URL,
-                headers=headers,
-                json={"target_path": "/api/v0/chat/completion"},
-                timeout=30,
-                impersonate="safari15_3",
-                **get_proxy_kwargs()
+                DEEPSEEK_CREATE_POW_URL, headers=headers, json={"target_path": "/api/v0/chat/completion"},
+                timeout=30, impersonate="safari15_3", **get_proxy_kwargs()
             )
             data = resp.json()
             if data.get("code") == 0:
                 c = data["data"]["biz_data"]["challenge"]
-                answer = compute_pow_answer(
-                    c["algorithm"], c["challenge"], c["salt"], 
-                    c.get("difficulty", 144000), c.get("expire_at", 1680000000), 
-                    c["signature"], c["target_path"], WASM_PATH
+                ans = compute_pow_answer(
+                    c["algorithm"], c["challenge"], c["salt"], c.get("difficulty", 144000),
+                    c.get("expire_at", 1680000000), c["signature"], c["target_path"], WASM_PATH
                 )
-                if answer:
-                    pow_dict = {
-                        "algorithm": c["algorithm"],
-                        "challenge": c["challenge"],
-                        "salt": c["salt"],
-                        "answer": answer,
-                        "signature": c["signature"],
-                        "target_path": c["target_path"],
+                if ans:
+                    pow_data = {
+                        "algorithm": c["algorithm"], "challenge": c["challenge"], "salt": c["salt"],
+                        "answer": ans, "signature": c["signature"], "target_path": c["target_path"]
                     }
-                    pow_str = json.dumps(pow_dict, separators=(",", ":"), ensure_ascii=False)
-                    return base64.b64encode(pow_str.encode("utf-8")).decode("utf-8").rstrip()
-        except Exception as e:
-            logger.warning(f"[PoW] Error: {e}")
-            time.sleep(1)
+                    return base64.b64encode(json.dumps(pow_data, separators=(",", ":"), ensure_ascii=False).encode()).decode().rstrip()
+        except: time.sleep(1)
     return None
 
-def create_session(token, max_attempts=3):
+def create_session(token):
     headers = get_auth_headers(token)
-    for _ in range(max_attempts):
+    for _ in range(3):
         try:
             resp = requests.post(
-                DEEPSEEK_CREATE_SESSION_URL, 
-                headers=headers, 
-                json={"agent": "chat"}, 
-                impersonate="safari15_3",
-                **get_proxy_kwargs()
+                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={"agent": "chat"},
+                impersonate="safari15_3", **get_proxy_kwargs()
             )
-            data = resp.json()
-            if data.get("code") == 0:
-                return data["data"]["biz_data"]["id"]
-        except Exception as e:
-            logger.warning(f"[Session] Error: {e}")
-        time.sleep(1)
+            if resp.json().get("code") == 0: return resp.json()["data"]["biz_data"]["id"]
+        except: time.sleep(1)
     return None
 
 def messages_prepare(messages: list) -> str:
@@ -333,185 +282,202 @@ def messages_prepare(messages: list) -> str:
     final = "".join(parts)
     return re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
 
+# -------------------------- Streaming Logic (Advanced Parser) --------------------------
+def sse_generator(response, model, chat_id, created, thinking_enabled):
+    last_send = time.time()
+    result_queue = queue.Queue()
+    
+    def reader():
+        try:
+            for line in response.iter_lines():
+                if not line: continue
+                line = line.decode('utf-8')
+                if not line.startswith("data:"): continue
+                
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    result_queue.put("DONE")
+                    break
+                
+                try:
+                    chunk = json.loads(data_str)
+                    if "v" not in chunk: continue
+                    val = chunk["v"]
+
+                    # 1. Xử lý trường hợp "fragments" (Chứa từ đầu tiên "Hello")
+                    # Cấu trúc: "v": [{"v": [...], "p": "fragments"}, ...]
+                    if isinstance(val, list):
+                        for item in val:
+                            # Check finish
+                            if item.get("p") == "status" and item.get("v") == "FINISHED":
+                                result_queue.put("DONE")
+                                return
+                            
+                            # Check fragments
+                            if item.get("p") == "fragments" and isinstance(item.get("v"), list):
+                                for fragment in item["v"]:
+                                    if "content" in fragment:
+                                        result_queue.put({"type": "text", "content": fragment["content"]})
+                        continue
+
+                    # 2. Xử lý text thông thường hoặc thinking
+                    # Cấu trúc: "v": " word"
+                    if isinstance(val, str):
+                        content = val
+                        p = chunk.get("p", "")
+                        
+                        # Mapping path
+                        msg_type = "text"
+                        if p == "response/thinking_content":
+                            msg_type = "thinking"
+                        elif p == "response/fragments/0/content":
+                            msg_type = "text" # Append explicit
+                        elif p == "response/search_status":
+                            continue 
+                        
+                        if content:
+                            result_queue.put({"type": msg_type, "content": content})
+                except Exception as e:
+                    # logger.warning(f"Parse error: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Stream reader error: {e}")
+            result_queue.put("DONE")
+        finally:
+            response.close()
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+
+    while True:
+        try:
+            item = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT)
+            if item == "DONE":
+                yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            
+            delta = {}
+            if item["type"] == "thinking" and thinking_enabled:
+                delta["reasoning_content"] = item["content"]
+            elif item["type"] == "text":
+                delta["content"] = item["content"]
+            
+            if delta:
+                chunk_data = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk_data)}\n\n"
+                last_send = time.time()
+                
+        except queue.Empty:
+            yield ": keep-alive\n\n"
+
 # -------------------------- Endpoints --------------------------
 
 @app.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key)):
-    current_time = int(time.time())
-    models = [
-        {"id": "deepseek-chat", "object": "model", "created": current_time, "owned_by": "deepseek"},
-        {"id": "deepseek-reasoner", "object": "model", "created": current_time, "owned_by": "deepseek"},
-    ]
-    return JSONResponse(content={"object": "list", "data": models})
+    t = int(time.time())
+    return JSONResponse(content={"object": "list", "data": [
+        {"id": "deepseek-chat", "object": "model", "created": t, "owned_by": "deepseek"},
+        {"id": "deepseek-reasoner", "object": "model", "created": t, "owned_by": "deepseek"}
+    ]})
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, api_key: str = Depends(verify_api_key)):
     try:
-        req_data = await request.json()
-        model = req_data.get("model", "deepseek-chat")
-        messages = req_data.get("messages", [])
-        stream = req_data.get("stream", False)
+        req = await request.json()
+        model = req.get("model", "deepseek-chat")
+        messages = req.get("messages", [])
+        stream = req.get("stream", False)
 
         model_lower = model.lower()
-        thinking_enabled = ("reasoner" in model_lower or "r1" in model_lower)
-        search_enabled = ("search" in model_lower)
+        thinking = "reasoner" in model_lower or "r1" in model_lower
+        search = "search" in model_lower
 
-        ds_token = get_valid_token(request)
-        session_id = create_session(ds_token)
-        pow_resp = get_pow_response(ds_token)
+        token = get_valid_token(request)
+        session_id = create_session(token)
+        pow_resp = get_pow_response(token)
         
         if not session_id or not pow_resp:
-            raise HTTPException(status_code=500, detail="DeepSeek upstream auth failed")
+            raise HTTPException(status_code=500, detail="DeepSeek auth failed")
 
-        final_prompt = messages_prepare(messages)
-        headers = {**get_auth_headers(ds_token), "x-ds-pow-response": pow_resp}
+        # Tạo payload chuẩn theo request mẫu của bạn
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
-            "prompt": final_prompt,
+            "prompt": messages_prepare(messages),
             "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "search_enabled": search_enabled,
+            "thinking_enabled": thinking,
+            "search_enabled": search,
+            "client_stream_id": f"20251126-{uuid.uuid4().hex[:16]}" # Fake client_stream_id
         }
+        headers = {**get_auth_headers(token), "x-ds-pow-response": pow_resp}
 
-        ds_resp = None
-        for _ in range(3):
-            try:
-                ds_resp = requests.post(
-                    DEEPSEEK_COMPLETION_URL, headers=headers, json=payload, stream=True, 
-                    impersonate="safari15_3", **get_proxy_kwargs()
-                )
-                if ds_resp.status_code == 200: break
-            except Exception:
-                time.sleep(1)
+        resp = requests.post(
+            DEEPSEEK_COMPLETION_URL, headers=headers, json=payload, stream=True, 
+            impersonate="safari15_3", **get_proxy_kwargs()
+        )
         
-        if not ds_resp or ds_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="DeepSeek API error")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Upstream Error: {resp.text}")
 
-        created = int(time.time())
         chat_id = f"chatcmpl-{session_id}"
+        created = int(time.time())
 
         if stream:
-            return StreamingResponse(
-                stream_generator(ds_resp, model, chat_id, created, thinking_enabled),
-                media_type="text/event-stream"
-            )
-        else:
-            return await handle_non_stream(ds_resp, model, chat_id, created, thinking_enabled)
+            return StreamingResponse(sse_generator(resp, model, chat_id, created, thinking), media_type="text/event-stream")
+        
+        # Non-stream handling (Cập nhật logic parse fragments)
+        text_content = ""
+        think_content = ""
+        try:
+            for line in resp.iter_lines():
+                if not line: continue
+                line_str = line.decode('utf-8')
+                if not line_str.startswith("data:") or "[DONE]" in line_str: continue
+                try:
+                    chk = json.loads(line_str[5:].strip())
+                    if "v" not in chk: continue
+                    val = chk["v"]
 
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error in chat_completions: {e}")
-        return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
-
-def stream_generator(response, model, chat_id, created, thinking_enabled):
-    last_send = time.time()
-    yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
-
-    try:
-        for line in response.iter_lines():
-            if not line: continue
-            line = line.decode('utf-8')
-            if not line.startswith("data:"): continue
-            
-            data_str = line[5:].strip()
-            if data_str == "[DONE]": break
-            
-            try:
-                chunk = json.loads(data_str)
-                content = ""
-                msg_type = "text"
-                
-                if "v" in chunk:
-                    val = chunk["v"]
+                    # Logic parse giống hệt stream
                     if isinstance(val, list):
                         for item in val:
-                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return
+                            if item.get("p") == "fragments" and isinstance(item.get("v"), list):
+                                for fragment in item["v"]:
+                                    if "content" in fragment:
+                                        text_content += fragment["content"]
                     elif isinstance(val, str):
-                        content = val
-                        p = chunk.get("p", "")
-                        if p == "response/thinking_content":
-                            msg_type = "thinking"
-                        elif p == "response/search_status":
-                            continue 
-                        
-                        delta = {}
-                        if msg_type == "thinking" and thinking_enabled:
-                            delta["reasoning_content"] = content
-                        elif msg_type == "text":
-                            delta["content"] = content
-                            
-                        if delta:
-                            out = {
-                                "id": chat_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                            }
-                            yield f"data: {json.dumps(out)}\n\n"
-                            
-            except Exception:
-                continue
-                
-            if time.time() - last_send > KEEP_ALIVE_TIMEOUT:
-                yield ": keep-alive\n\n"
-                last_send = time.time()
-                
-    finally:
-        response.close()
-
-async def handle_non_stream(response, model, chat_id, created, thinking_enabled):
-    full_text = ""
-    full_think = ""
-    
-    try:
-        for line in response.iter_lines():
-            line = line.decode('utf-8')
-            if not line.startswith("data:") or "[DONE]" in line: continue
-            try:
-                chunk = json.loads(line[5:].strip())
-                if "v" in chunk and isinstance(chunk["v"], str):
-                    p = chunk.get("p", "")
-                    if p == "response/content":
-                        full_text += chunk["v"]
-                    elif p == "response/thinking_content":
-                        full_think += chunk["v"]
-            except: pass
-            
-        # Tính usage đơn giản
-        completion_len = len(full_text) + len(full_think)
-        usage = {
-            "prompt_tokens": 0, 
-            "completion_tokens": estimate_tokens(full_text + full_think), 
-            "total_tokens": estimate_tokens(full_text + full_think)
-        }
-
-        result = {
-            "id": chat_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
+                        p = chk.get("p", "")
+                        if p == "response/content" or p == "response/fragments/0/content": text_content += val
+                        elif p == "response/thinking_content": think_content += val
+                except: pass
+        finally: resp.close()
+        
+        return JSONResponse({
+            "id": chat_id, "object": "chat.completion", "created": created, "model": model,
             "choices": [{
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": full_text,
-                    "reasoning_content": full_think if thinking_enabled else None
+                    "content": text_content,
+                    "reasoning_content": think_content if thinking else None
                 },
                 "finish_reason": "stop"
             }],
-            "usage": usage
-        }
-        return JSONResponse(content=result)
-    finally:
-        response.close()
+            "usage": {"prompt_tokens": 0, "completion_tokens": estimate_tokens(text_content), "total_tokens": estimate_tokens(text_content)}
+        })
+
+    except Exception as e:
+        logger.error(f"Chat Error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Server starting on port {SERVER_PORT} (No Transformers)...")
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
