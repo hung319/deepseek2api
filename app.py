@@ -77,7 +77,6 @@ DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/crea
 DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_challenge"
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 
-# Cập nhật Header theo request mẫu của bạn (App v1.5.0)
 BASE_HEADERS = {
     "Host": DEEPSEEK_HOST,
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
@@ -85,7 +84,7 @@ BASE_HEADERS = {
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
     "x-client-platform": "web",
-    "x-client-version": "1.5.0", # Cập nhật version mới
+    "x-client-version": "1.5.0",
     "x-client-locale": "en_US",
     "accept-charset": "UTF-8",
     "origin": f"https://{DEEPSEEK_HOST}",
@@ -282,7 +281,7 @@ def messages_prepare(messages: list) -> str:
     final = "".join(parts)
     return re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
 
-# -------------------------- Streaming Logic (Advanced Parser) --------------------------
+# -------------------------- Streaming Logic (Fixed Logic) --------------------------
 def sse_generator(response, model, chat_id, created, thinking_enabled):
     last_send = time.time()
     result_queue = queue.Queue()
@@ -304,41 +303,39 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     if "v" not in chunk: continue
                     val = chunk["v"]
 
-                    # 1. Xử lý trường hợp "fragments" (Chứa từ đầu tiên "Hello")
-                    # Cấu trúc: "v": [{"v": [...], "p": "fragments"}, ...]
+                    # 1. Fragment (Chữ cái đầu tiên, thường nằm trong list)
                     if isinstance(val, list):
                         for item in val:
-                            # Check finish
                             if item.get("p") == "status" and item.get("v") == "FINISHED":
                                 result_queue.put("DONE")
                                 return
-                            
-                            # Check fragments
+                            # DeepSeek structure: v -> list -> item has p="fragments"
                             if item.get("p") == "fragments" and isinstance(item.get("v"), list):
                                 for fragment in item["v"]:
                                     if "content" in fragment:
                                         result_queue.put({"type": "text", "content": fragment["content"]})
                         continue
 
-                    # 2. Xử lý text thông thường hoặc thinking
-                    # Cấu trúc: "v": " word"
+                    # 2. String Content (Các chữ tiếp theo)
                     if isinstance(val, str):
                         content = val
-                        p = chunk.get("p", "")
+                        p = chunk.get("p") # Lấy p, có thể là None
+
+                        # --- LOGIC QUAN TRỌNG ĐÃ SỬA ---
+                        msg_type = "text" # Mặc định là text
                         
-                        # Mapping path
-                        msg_type = "text"
                         if p == "response/thinking_content":
                             msg_type = "thinking"
-                        elif p == "response/fragments/0/content":
-                            msg_type = "text" # Append explicit
                         elif p == "response/search_status":
-                            continue 
+                            continue # Bỏ qua search status
+                        
+                        # Nếu p == None hoặc p == "response/content" hoặc bất kỳ cái gì khác không phải thinking/search
+                        # thì coi như là text.
                         
                         if content:
                             result_queue.put({"type": msg_type, "content": content})
+
                 except Exception as e:
-                    # logger.warning(f"Parse error: {e}")
                     continue
         except Exception as e:
             logger.error(f"Stream reader error: {e}")
@@ -407,7 +404,6 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if not session_id or not pow_resp:
             raise HTTPException(status_code=500, detail="DeepSeek auth failed")
 
-        # Tạo payload chuẩn theo request mẫu của bạn
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
@@ -415,7 +411,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
             "ref_file_ids": [],
             "thinking_enabled": thinking,
             "search_enabled": search,
-            "client_stream_id": f"20251126-{uuid.uuid4().hex[:16]}" # Fake client_stream_id
+            "client_stream_id": f"20251126-{uuid.uuid4().hex[:16]}"
         }
         headers = {**get_auth_headers(token), "x-ds-pow-response": pow_resp}
 
@@ -433,7 +429,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if stream:
             return StreamingResponse(sse_generator(resp, model, chat_id, created, thinking), media_type="text/event-stream")
         
-        # Non-stream handling (Cập nhật logic parse fragments)
+        # Non-stream handling (Cập nhật logic thiếu p)
         text_content = ""
         think_content = ""
         try:
@@ -446,7 +442,6 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                     if "v" not in chk: continue
                     val = chk["v"]
 
-                    # Logic parse giống hệt stream
                     if isinstance(val, list):
                         for item in val:
                             if item.get("p") == "fragments" and isinstance(item.get("v"), list):
@@ -454,9 +449,14 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                                     if "content" in fragment:
                                         text_content += fragment["content"]
                     elif isinstance(val, str):
-                        p = chk.get("p", "")
-                        if p == "response/content" or p == "response/fragments/0/content": text_content += val
-                        elif p == "response/thinking_content": think_content += val
+                        p = chk.get("p") # Lấy p (có thể None)
+                        if p == "response/thinking_content":
+                            think_content += val
+                        elif p == "response/search_status":
+                            continue
+                        else:
+                            # Mặc định là text nếu không phải thinking/search
+                            text_content += val
                 except: pass
         finally: resp.close()
         
