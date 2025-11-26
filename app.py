@@ -155,7 +155,24 @@ class SessionManager:
         
         try:
             url = "https://chat.deepseek.com/api/v0/users/login"
-            payload = {"email": session["config"]["email"], "password": session["config"]["password"]}
+            
+            # --- FIX: Thêm device_id và os ---
+            payload = {
+                "email": session["config"]["email"], 
+                "password": session["config"]["password"],
+                "device_id": str(uuid.uuid4()),  # Tạo UUID ngẫu nhiên cho thiết bị
+                "os": "web"                      # Khai báo là nền tảng Web
+            }
+            
+            # Hỗ trợ trường hợp login bằng mobile (nếu config có)
+            if "mobile" in session["config"] and not session["config"].get("email"):
+                 payload = {
+                    "mobile": session["config"]["mobile"], 
+                    "password": session["config"]["password"],
+                    "area_code": "+86",
+                    "device_id": str(uuid.uuid4()),
+                    "os": "web"
+                 }
             
             r = requests.post(
                 url, json=payload, impersonate="chrome120",
