@@ -211,6 +211,51 @@ class SessionManager:
 
 session_manager = SessionManager()
 
+# --- HELPER: Format tin nhắn chuẩn DeepSeek ---
+def messages_prepare(messages: list) -> str:
+    """
+    Chuyển đổi list messages thành string format đặc biệt của DeepSeek.
+    Logic được port từ file gốc app (2).py
+    """
+    merged = []
+    # 1. Merge các tin nhắn cùng role liên tiếp
+    for m in messages:
+        role = m.role.lower()
+        content = m.content
+        
+        # Xử lý content là list (trường hợp client gửi multimodal/image)
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    texts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    texts.append(item)
+            content = "\n".join(texts)
+            
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["content"] += "\n\n" + content
+        else:
+            merged.append({"role": role, "content": content})
+
+    # 2. Gắn thẻ <｜User｜>, <｜Assistant｜>
+    parts = []
+    for idx, block in enumerate(merged):
+        role = block["role"]
+        text = block["content"]
+        
+        if role == "assistant":
+            parts.append(f"<｜Assistant｜>{text}<｜end of sentence｜>")
+        elif role in ("user", "system"):
+            if idx > 0:
+                parts.append(f"<｜User｜>{text}")
+            else:
+                parts.append(text) # Tin nhắn đầu tiên không cần tag User?
+        else:
+            parts.append(text)
+            
+    return "".join(parts)
+
 # --- 5. APP & ROUTES ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -245,20 +290,26 @@ async def list_models():
 async def chat_completions(req: ChatCompletionRequest):
     session = session_manager.get_session()
     
+    # Cấu hình giả lập giống file gốc
     headers = {
         "Authorization": f"Bearer {session['token']}",
         "User-Agent": session['user_agent'],
         "Content-Type": "application/json",
         "X-App-Version": "20240125.0",
+        "Accept": "*/*"
     }
+    
+    # Chọn impersonate giống file gốc (Quan trọng!)
+    IMPERSONATE = "safari15_3"
 
     # 1. PoW & Challenge
     try:
         pow_req = requests.post(
             "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
             json={"target_path": "/api/v0/chat/completion"},
-            headers=headers, impersonate="chrome120",
-            proxies={"https": Config.PROXY} if Config.PROXY else None
+            headers=headers, impersonate=IMPERSONATE,
+            proxies={"https": Config.PROXY} if Config.PROXY else None,
+            timeout=30
         )
         if pow_req.status_code == 200:
             c_data = pow_req.json().get("data", {}).get("biz_data", {}).get("challenge")
@@ -281,46 +332,48 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         logger.warning(f"PoW warning: {e}")
 
-    # 2. Session ID
+    # 2. Tạo Session ID
     try:
         s_resp = requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
-            json={"agent": "chat"}, headers=headers, impersonate="chrome120",
-            proxies={"https": Config.PROXY} if Config.PROXY else None
+            json={"agent": "chat"}, headers=headers, impersonate=IMPERSONATE,
+            proxies={"https": Config.PROXY} if Config.PROXY else None,
+            timeout=30
         )
         chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
     except:
         chat_session_id = None
 
-    # 3. Payload
-    full_prompt = ""
-    for msg in req.messages:
-        role = "User" if msg.role == "user" else "Assistant"
-        if msg.role == "system": role = "System"
-        full_prompt += f"\n\n{role}: {msg.content}"
-    full_prompt += "\n\nAssistant:"
-
+    # 3. Chuẩn bị Payload (Dùng hàm messages_prepare mới)
+    final_prompt = messages_prepare(req.messages)
+    
+    # Logic bật/tắt thinking giống file gốc
+    thinking_enabled = False
+    if "reasoner" in req.model or "r1" in req.model:
+        thinking_enabled = True
+        
     payload = {
         "chat_session_id": chat_session_id,
         "parent_message_id": None,
-        "prompt": full_prompt.strip(),
+        "prompt": final_prompt,
         "stream": True,
-        "ref_file_ids": [],
-        "thinking_enabled": False,
+        "ref_file_ids": [], # File gốc để mảng rỗng
+        "thinking_enabled": thinking_enabled,
         "search_enabled": False
     }
 
-    # 4. Request
+    # 4. Request Upstream
     try:
         r = requests.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
-            json=payload, headers=headers, impersonate="chrome120", stream=True,
-            proxies={"https": Config.PROXY} if Config.PROXY else None
+            json=payload, headers=headers, impersonate=IMPERSONATE, stream=True,
+            proxies={"https": Config.PROXY} if Config.PROXY else None,
+            timeout=120
         )
     except Exception as e:
         raise HTTPException(502, f"Upstream connect error: {e}")
 
-    # 5. Stream Converter
+    # 5. Stream Converter (Quan trọng: Logic parse v/p từ file gốc)
     async def openai_stream():
         chat_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
@@ -336,24 +389,45 @@ async def chat_completions(req: ChatCompletionRequest):
                 break
             
             try:
-                data = json.loads(txt)
+                chunk = json.loads(txt)
                 content = ""
-                choices = data.get("choices", [])
-                if choices:
-                    content = choices[0].get("delta", {}).get("content", "")
                 
+                # --- LOGIC PARSE TỪ FILE GỐC ---
+                # Case 1: Chuẩn OpenAI (đôi khi trả về)
+                if "choices" in chunk:
+                    choice = chunk["choices"][0]
+                    if choice.get("finish_reason") == "backend_busy":
+                        content = " [Server Busy, try again] "
+                    else:
+                        content = choice.get("delta", {}).get("content", "")
+                
+                # Case 2: Chuẩn DeepSeek Web (v, p keys)
+                elif "v" in chunk:
+                    v_val = chunk.get("v")
+                    p_val = chunk.get("p") # Path, ví dụ: "response/content" hoặc "response/thinking_content"
+                    
+                    # Chỉ lấy text nếu v là string (nếu v là list thì là status update)
+                    if isinstance(v_val, str):
+                        content = v_val
+                        # Nếu là thinking content, có thể format lại để hiển thị
+                        if "thinking" in str(p_val):
+                            content = f"{content}" 
+
                 if content:
-                    chunk = {
+                    resp_chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
                         "created": created, "model": req.model,
                         "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-            except: pass
+                    yield f"data: {json.dumps(resp_chunk)}\n\n"
+            except Exception as e:
+                # Bỏ qua các line lỗi parse để không ngắt stream
+                continue
 
     if req.stream:
         return StreamingResponse(openai_stream(), media_type="text/event-stream")
     
+    # Non-stream
     full_text = ""
     async for chunk in openai_stream():
         if "[DONE]" in chunk: break
