@@ -146,7 +146,8 @@ class SessionManager:
             self.sessions[email] = {
                 "config": acc,
                 "token": None,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                # UPDATE: Dùng User-Agent của Safari để khớp với impersonate="safari15_3"
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15"
             }
 
     def login(self, email: str) -> bool:
@@ -155,16 +156,14 @@ class SessionManager:
         
         try:
             url = "https://chat.deepseek.com/api/v0/users/login"
-            
-            # --- FIX: Thêm device_id và os ---
             payload = {
                 "email": session["config"]["email"], 
                 "password": session["config"]["password"],
-                "device_id": str(uuid.uuid4()),  # Tạo UUID ngẫu nhiên cho thiết bị
-                "os": "web"                      # Khai báo là nền tảng Web
+                "device_id": str(uuid.uuid4()),
+                "os": "web"
             }
             
-            # Hỗ trợ trường hợp login bằng mobile (nếu config có)
+            # Hỗ trợ login mobile
             if "mobile" in session["config"] and not session["config"].get("email"):
                  payload = {
                     "mobile": session["config"]["mobile"], 
@@ -174,15 +173,16 @@ class SessionManager:
                     "os": "web"
                  }
             
+            # UPDATE: Dùng safari15_3 cho login
             r = requests.post(
-                url, json=payload, impersonate="chrome120",
-                proxies={"https": Config.PROXY} if Config.PROXY else None
+                url, json=payload, impersonate="safari15_3",
+                proxies={"https": Config.PROXY} if Config.PROXY else None,
+                timeout=30
             )
             
             if r.status_code == 200:
                 data = r.json()
                 token = None
-                # DeepSeek json structure parsing
                 if "data" in data:
                     if "biz_data" in data["data"] and "user" in data["data"]["biz_data"]:
                         token = data["data"]["biz_data"]["user"]["token"]
@@ -293,16 +293,24 @@ async def chat_completions(req: ChatCompletionRequest):
     
     logger.info(f"[{request_id}] 🚀 New Chat Request. Model: {req.model}")
 
+    # UPDATE: Headers đầy đủ giống hệt trình duyệt Safari
     headers = {
         "Authorization": f"Bearer {session['token']}",
-        "User-Agent": session['user_agent'], # Đây là UA của Chrome 120
+        "User-Agent": session['user_agent'],
         "Content-Type": "application/json",
-        "Accept": "*/*"
-        # Đã bỏ X-App-Version để tránh bị lộ là bot
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://chat.deepseek.com/",   # Quan trọng: Cloudflare check cái này
+        "Origin": "https://chat.deepseek.com",     # Quan trọng
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Connection": "keep-alive",
+        "X-App-Version": "20241108.0" # Version giả lập từ file gốc
     }
     
-    # --- FIX: Đổi sang chrome120 để khớp với User-Agent ---
-    IMPERSONATE = "chrome120"
+    # UPDATE: Dùng safari15_3 đồng bộ với User-Agent
+    IMPERSONATE = "safari15_3"
 
     # --- 1. PoW & Challenge ---
     try:
@@ -345,12 +353,12 @@ async def chat_completions(req: ChatCompletionRequest):
             proxies={"https": Config.PROXY} if Config.PROXY else None,
             timeout=30
         )
-        # Log response nếu lỗi
-        if s_resp.status_code != 200:
-             logger.error(f"[{request_id}] ❌ Session Create Failed: {s_resp.status_code} {s_resp.text[:200]}")
-        else:
+        if s_resp.status_code == 200:
              chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
              logger.info(f"[{request_id}] 🆔 Session: {chat_session_id}")
+        else:
+             # Log warning nhưng không return lỗi ngay, đôi khi chat vẫn chạy được
+             logger.warning(f"[{request_id}] ⚠️ Session Create returned {s_resp.status_code}")
     except Exception as e:
         logger.error(f"[{request_id}] Session Create Exception: {e}")
 
@@ -382,7 +390,8 @@ async def chat_completions(req: ChatCompletionRequest):
         
         if r.status_code != 200:
             logger.error(f"[{request_id}] ❌ Chat Failed: {r.status_code} {r.text[:200]}")
-            raise HTTPException(r.status_code, f"DeepSeek Error: {r.text[:200]}")
+            # Nếu 403, thường là do Cloudflare chặn
+            raise HTTPException(r.status_code, f"DeepSeek Error: {r.status_code}")
 
     except Exception as e:
         raise HTTPException(502, f"Connection Error: {e}")
@@ -406,7 +415,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 chunk = json.loads(txt)
                 content = ""
                 
-                # Logic Parse đa năng
+                # Logic Parse đa năng (copy từ file gốc)
                 if "choices" in chunk:
                     choice = chunk["choices"][0]
                     if choice.get("finish_reason") == "backend_busy":
@@ -416,9 +425,11 @@ async def chat_completions(req: ChatCompletionRequest):
                 
                 elif "v" in chunk:
                     v_val = chunk.get("v")
+                    p_val = chunk.get("p")
+                    # Handle text content
                     if isinstance(v_val, str):
                         content = v_val
-
+                
                 if content:
                     resp_chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
@@ -432,6 +443,7 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         return StreamingResponse(openai_stream(), media_type="text/event-stream")
     
+    # Non-stream simulation
     full_text = ""
     async for chunk in openai_stream():
         if "[DONE]" in chunk: break
