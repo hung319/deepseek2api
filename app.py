@@ -2,19 +2,12 @@ import base64
 import ctypes
 import json
 import logging
-import queue
 import random
 import re
 import struct
-import threading
 import time
 import os
-import sys
-from typing import Optional, List
-
-# Load environment variables
 from dotenv import load_dotenv
-import transformers
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,22 +29,13 @@ except json.JSONDecodeError:
     print("Lỗi: DEEPSEEK_ACCOUNTS trong .env không đúng định dạng JSON.")
     ACCOUNTS_LIST = []
 
-# -------------------------- Khởi tạo Tokenizer & Logger --------------------------
-# Lưu ý: Cần folder tokenizer hoặc set path đúng
-chat_tokenizer_dir = "./" 
-try:
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        chat_tokenizer_dir, trust_remote_code=True
-    )
-except Exception as e:
-    print(f"Warning: Không load được tokenizer từ {chat_tokenizer_dir}. Token count có thể không chính xác. {e}")
-
+# -------------------------- Logger --------------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("DeepSeek-Proxy")
 
-app = FastAPI(docs_url=None, redoc_url=None) # Tắt docs mặc định để ẩn danh
+app = FastAPI(docs_url=None, redoc_url=None)
 
 # CORS
 app.add_middleware(
@@ -64,12 +48,18 @@ app.add_middleware(
 
 security = HTTPBearer()
 
+# -------------------------- Helper Token Count (Thay thế Transformers) --------------------------
+def estimate_tokens(text: str) -> int:
+    """Ước lượng số token (quy tắc ngón tay cái: 4 ký tự ~ 1 token)"""
+    if not text:
+        return 0
+    return len(text) // 4
+
 # -------------------------- Quản lý tài khoản Global --------------------------
 account_queue = []
 
 def init_account_queue():
     global account_queue
-    # Load từ env, gán token rỗng nếu chưa có
     raw_accounts = ACCOUNTS_LIST[:]
     for acc in raw_accounts:
         if "token" not in acc:
@@ -105,15 +95,12 @@ KEEP_ALIVE_TIMEOUT = 5
 # -------------------------- Helper Functions --------------------------
 
 def get_proxy_kwargs():
-    """Trả về cấu hình proxy cho requests"""
     if PROXY_URL:
         return {"proxies": {"http": PROXY_URL, "https": PROXY_URL}}
     return {}
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Middleware kiểm tra API Key từ Client"""
     token = credentials.credentials
-    # Nếu không set key trong env thì cho qua (dev mode), ngược lại check list
     if SERVER_API_KEYS and SERVER_API_KEYS != [""]:
         if token not in SERVER_API_KEYS:
             raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -150,7 +137,7 @@ def login_deepseek_via_account(account):
             headers=BASE_HEADERS, 
             json=payload, 
             impersonate="safari15_3",
-            **get_proxy_kwargs() # Thêm Proxy
+            **get_proxy_kwargs()
         )
         resp.raise_for_status()
         data = resp.json()
@@ -161,8 +148,6 @@ def login_deepseek_via_account(account):
     try:
         new_token = data["data"]["biz_data"]["user"]["token"]
         account["token"] = new_token
-        # Lưu ý: Token chỉ lưu trong RAM, restart server sẽ login lại.
-        # Nếu muốn lưu file, cần logic ghi file riêng, tránh ghi đè .env
         return new_token
     except Exception as e:
         logger.error(f"[Login] Parse response failed: {data}")
@@ -176,7 +161,6 @@ def choose_account(exclude_ids=None):
         acc = account_queue[i]
         acc_id = get_account_identifier(acc)
         if acc_id and acc_id not in exclude_ids:
-            # Move to end of queue (Simple Round Robin)
             account_queue.pop(i)
             account_queue.append(acc)
             return acc
@@ -185,10 +169,6 @@ def choose_account(exclude_ids=None):
     return None
 
 def get_valid_token(request: Request):
-    """
-    Lấy token hợp lệ của DeepSeek.
-    Logic: Client gọi API -> Server chọn Acc -> Login (nếu cần) -> Trả về Token DeepSeek
-    """
     if not hasattr(request.state, "tried_accounts"):
         request.state.tried_accounts = []
         
@@ -209,7 +189,6 @@ def get_auth_headers(token):
     return {**BASE_HEADERS, "authorization": f"Bearer {token}"}
 
 # -------------------------- PoW & WASM --------------------------
-# Giữ nguyên logic WASM phức tạp để tính Proof of Work
 def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, signature, target_path, wasm_path):
     if algorithm != "DeepSeekHashV1":
         return None
@@ -317,10 +296,7 @@ def create_session(token, max_attempts=3):
         time.sleep(1)
     return None
 
-# -------------------------- Helpers --------------------------
-
 def messages_prepare(messages: list) -> str:
-    # Logic gộp message, thêm tag (Assistant/User) giống file gốc
     processed = []
     for m in messages:
         role = m.get("role", "")
@@ -355,14 +331,12 @@ def messages_prepare(messages: list) -> str:
             parts.append(text)
             
     final = "".join(parts)
-    # Remove markdown images
     return re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
 
 # -------------------------- Endpoints --------------------------
 
 @app.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key)):
-    # Trả về danh sách model giả lập OpenAI
     current_time = int(time.time())
     models = [
         {"id": "deepseek-chat", "object": "model", "created": current_time, "owned_by": "deepseek"},
@@ -378,27 +352,17 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         messages = req_data.get("messages", [])
         stream = req_data.get("stream", False)
 
-        # 1. Config Model
         model_lower = model.lower()
-        thinking_enabled = False
-        search_enabled = False
-        
-        if "reasoner" in model_lower or "r1" in model_lower:
-            thinking_enabled = True
-        if "search" in model_lower:
-            search_enabled = True
+        thinking_enabled = ("reasoner" in model_lower or "r1" in model_lower)
+        search_enabled = ("search" in model_lower)
 
-        # 2. Prepare DeepSeek Auth & Context
-        ds_token = get_valid_token(request) # Sẽ retry/re-login nếu cần
+        ds_token = get_valid_token(request)
         session_id = create_session(ds_token)
         pow_resp = get_pow_response(ds_token)
         
         if not session_id or not pow_resp:
-            # Nếu auth lỗi, có thể do token hết hạn, ở đây đơn giản báo lỗi
-            # Trong thực tế nên trigger re-login và retry
             raise HTTPException(status_code=500, detail="DeepSeek upstream auth failed")
 
-        # 3. Request Upstream
         final_prompt = messages_prepare(messages)
         headers = {**get_auth_headers(ds_token), "x-ds-pow-response": pow_resp}
         payload = {
@@ -410,7 +374,6 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
             "search_enabled": search_enabled,
         }
 
-        # Gọi request (có retry logic đơn giản)
         ds_resp = None
         for _ in range(3):
             try:
@@ -425,7 +388,6 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if not ds_resp or ds_resp.status_code != 200:
             raise HTTPException(status_code=502, detail="DeepSeek API error")
 
-        # 4. Response Handling
         created = int(time.time())
         chat_id = f"chatcmpl-{session_id}"
 
@@ -443,10 +405,8 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         logger.error(f"Error in chat_completions: {e}")
         return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
 
-# Logic xử lý stream đã được tách gọn
 def stream_generator(response, model, chat_id, created, thinking_enabled):
     last_send = time.time()
-    
     yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
     try:
@@ -461,12 +421,11 @@ def stream_generator(response, model, chat_id, created, thinking_enabled):
             try:
                 chunk = json.loads(data_str)
                 content = ""
-                msg_type = "text" # text or thinking
+                msg_type = "text"
                 
-                # Parse v/p format of DeepSeek
                 if "v" in chunk:
                     val = chunk["v"]
-                    if isinstance(val, list): # Check finish status
+                    if isinstance(val, list):
                         for item in val:
                             if item.get("p") == "status" and item.get("v") == "FINISHED":
                                 yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
@@ -478,9 +437,8 @@ def stream_generator(response, model, chat_id, created, thinking_enabled):
                         if p == "response/thinking_content":
                             msg_type = "thinking"
                         elif p == "response/search_status":
-                            continue # Skip search logs
+                            continue 
                         
-                        # Output OpenAI Delta
                         delta = {}
                         if msg_type == "thinking" and thinking_enabled:
                             delta["reasoning_content"] = content
@@ -500,7 +458,6 @@ def stream_generator(response, model, chat_id, created, thinking_enabled):
             except Exception:
                 continue
                 
-            # Keep-alive
             if time.time() - last_send > KEEP_ALIVE_TIMEOUT:
                 yield ": keep-alive\n\n"
                 last_send = time.time()
@@ -526,6 +483,14 @@ async def handle_non_stream(response, model, chat_id, created, thinking_enabled)
                         full_think += chunk["v"]
             except: pass
             
+        # Tính usage đơn giản
+        completion_len = len(full_text) + len(full_think)
+        usage = {
+            "prompt_tokens": 0, 
+            "completion_tokens": estimate_tokens(full_text + full_think), 
+            "total_tokens": estimate_tokens(full_text + full_think)
+        }
+
         result = {
             "id": chat_id,
             "object": "chat.completion",
@@ -540,7 +505,7 @@ async def handle_non_stream(response, model, chat_id, created, thinking_enabled)
                 },
                 "finish_reason": "stop"
             }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0} # Dummy usage
+            "usage": usage
         }
         return JSONResponse(content=result)
     finally:
@@ -548,5 +513,5 @@ async def handle_non_stream(response, model, chat_id, created, thinking_enabled)
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Server starting on port {SERVER_PORT}...")
+    print(f"Server starting on port {SERVER_PORT} (No Transformers)...")
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
