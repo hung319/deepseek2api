@@ -18,12 +18,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from curl_cffi import requests
-from wasmtime import Linker, Module, Store, Engine
+# --- FIX: Import thêm FuncType và ValType ---
+from wasmtime import Linker, Module, Store, Engine, FuncType, ValType
 
 # --- 1. CONFIG & INIT ---
 load_dotenv()
 
-# Cấu hình Log gọn gàng
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DeepSeekProxy")
 
@@ -31,9 +31,9 @@ class Config:
     ACCOUNTS = json.loads(os.getenv("DS_ACCOUNTS", "[]"))
     API_KEY = os.getenv("PROXY_API_KEY", "sk-default-key")
     PROXY = os.getenv("PROXY_URL", None)
-    WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm" # File gốc bắt buộc phải có
+    WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm"
 
-# Security Scheme
+# Security
 security_scheme = HTTPBearer()
 
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
@@ -41,7 +41,7 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(se
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return credentials.credentials
 
-# --- 2. MODELS (OpenAI Standard) ---
+# --- 2. MODELS ---
 class Message(BaseModel):
     role: str
     content: str
@@ -54,7 +54,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0
     frequency_penalty: Optional[float] = 0
 
-# --- 3. CORE LOGIC: WASM / PoW (Giữ nguyên logic gốc) ---
+# --- 3. CORE LOGIC: WASM / PoW (FIXED) ---
 class PoWManager:
     def __init__(self, wasm_path: str):
         self.ready = False
@@ -65,18 +65,24 @@ class PoWManager:
         try:
             self.engine = Engine()
             self.linker = Linker(self.engine)
-            self.linker.define_func("env", "emscripten_notify_memory_growth", lambda x: None)
+            
+            # --- FIX: Định nghĩa hàm Import với Type rõ ràng ---
+            # Hàm: emscripten_notify_memory_growth(index: i32) -> void
+            func_type = FuncType([ValType.i32()], []) 
+            
+            # Define func: (module, name, type, callback)
+            # Callback nhận (caller, arg1) hoặc (*args) tuỳ version, dùng *args cho an toàn
+            self.linker.define_func("env", "emscripten_notify_memory_growth", func_type, lambda *args: None)
             
             with open(wasm_path, "rb") as f:
                 self.module = Module(self.engine, f.read())
             
             self.ready = True
-            logger.info("✅ WASM Module loaded.")
+            logger.info("✅ WASM Module loaded successfully.")
         except Exception as e:
             logger.error(f"❌ Lỗi load WASM: {e}")
 
     def compute_answer(self, challenge_str: str, salt: str, difficulty: float, expire_at: int) -> Optional[int]:
-        """Logic giải đố DeepSeek (Sử dụng ctypes thao tác memory WASM)"""
         if not self.ready: return None
 
         store = Store(self.engine)
@@ -89,7 +95,6 @@ class PoWManager:
             alloc = exports["__wbindgen_export_0"]
             wasm_solve = exports["wasm_solve"]
 
-            # Helpers thao tác memory
             def get_mem_ptr():
                 return ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value
 
@@ -101,7 +106,6 @@ class PoWManager:
                 ctypes.memmove(base + ptr, data, length)
                 return ptr, length
 
-            # Prepare Inputs
             prefix = f"{salt}_{expire_at}_"
             retptr = add_to_stack(store, -16)
             
@@ -116,19 +120,18 @@ class PoWManager:
             status = struct.unpack("<i", ctypes.string_at(base + retptr, 4))[0]
             value = struct.unpack("<d", ctypes.string_at(base + retptr + 8, 8))[0]
 
-            add_to_stack(store, 16) # Cleanup
+            add_to_stack(store, 16)
 
             if status == 0: return None
             return int(value)
 
         except Exception as e:
-            logger.error(f"PoW Error: {e}")
+            logger.error(f"PoW Runtime Error: {e}")
             return None
 
-# Khởi tạo PoW Global
 pow_manager = PoWManager(Config.WASM_PATH)
 
-# --- 4. ACCOUNT & SESSION LOGIC ---
+# --- 4. SESSION MANAGER ---
 class SessionManager:
     def __init__(self):
         self.queue = []
@@ -159,11 +162,15 @@ class SessionManager:
                 proxies={"https": Config.PROXY} if Config.PROXY else None
             )
             
-            if r.status_code == 200 and "token" in r.text:
+            if r.status_code == 200:
                 data = r.json()
-                # Cấu trúc JSON DeepSeek có thể thay đổi, cần linh hoạt
-                token = data.get("data", {}).get("biz_data", {}).get("user", {}).get("token") or \
-                        data.get("data", {}).get("token")
+                token = None
+                # DeepSeek json structure parsing
+                if "data" in data:
+                    if "biz_data" in data["data"] and "user" in data["data"]["biz_data"]:
+                        token = data["data"]["biz_data"]["user"]["token"]
+                    elif "token" in data["data"]:
+                        token = data["data"]["token"]
                 
                 if token:
                     session["token"] = token
@@ -177,11 +184,8 @@ class SessionManager:
 
     def get_session(self):
         if not self.queue: raise HTTPException(500, "No accounts available")
-        
-        # Round Robin
         email = self.queue.pop(0)
         self.queue.append(email)
-        
         sess = self.sessions[email]
         if not sess["token"]:
             if not self.login(email):
@@ -190,14 +194,14 @@ class SessionManager:
 
 session_manager = SessionManager()
 
-# --- 5. FASTAPI APP ---
+# --- 5. APP & ROUTES ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Server Starting...")
     yield
     logger.info("🛑 Server Stopping...")
 
-app = FastAPI(title="DeepSeek OpenAI API", version="2.0", lifespan=lifespan, docs_url=None)
+app = FastAPI(title="DeepSeek OpenAI API", version="2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -206,7 +210,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 6. ENDPOINTS (OpenAI Only) ---
+@app.get("/")
+async def root():
+    return {"status": "running", "pow_ready": pow_manager.ready}
 
 @app.get("/v1/models")
 async def list_models():
@@ -226,10 +232,10 @@ async def chat_completions(req: ChatCompletionRequest):
         "Authorization": f"Bearer {session['token']}",
         "User-Agent": session['user_agent'],
         "Content-Type": "application/json",
-        "X-App-Version": "20240125.0", # Giả lập version app
+        "X-App-Version": "20240125.0",
     }
 
-    # 1. PoW Challenge (Nếu cần)
+    # 1. PoW & Challenge
     try:
         pow_req = requests.post(
             "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
@@ -258,7 +264,7 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         logger.warning(f"PoW warning: {e}")
 
-    # 2. Tạo Session ID (Bắt buộc với DeepSeek Web)
+    # 2. Session ID
     try:
         s_resp = requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
@@ -267,11 +273,9 @@ async def chat_completions(req: ChatCompletionRequest):
         )
         chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
     except:
-        chat_session_id = None # Có thể fail nếu token die
+        chat_session_id = None
 
-    # 3. Chuẩn bị Payload DeepSeek
-    # Gom lịch sử chat thành một prompt string (Cách đơn giản nhất cho Web API)
-    # Hoặc convert message struct nếu API hỗ trợ. Dưới đây là cách gom text an toàn:
+    # 3. Payload
     full_prompt = ""
     for msg in req.messages:
         role = "User" if msg.role == "user" else "Assistant"
@@ -285,11 +289,11 @@ async def chat_completions(req: ChatCompletionRequest):
         "prompt": full_prompt.strip(),
         "stream": True,
         "ref_file_ids": [],
-        "thinking_enabled": False, # Bật nếu muốn model R1
+        "thinking_enabled": False,
         "search_enabled": False
     }
 
-    # 4. Request Upstream
+    # 4. Request
     try:
         r = requests.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
@@ -299,7 +303,7 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         raise HTTPException(502, f"Upstream connect error: {e}")
 
-    # 5. Stream Converter (DeepSeek -> OpenAI)
+    # 5. Stream Converter
     async def openai_stream():
         chat_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
@@ -316,13 +320,11 @@ async def chat_completions(req: ChatCompletionRequest):
             
             try:
                 data = json.loads(txt)
-                # Parse content từ DeepSeek structure
                 content = ""
                 choices = data.get("choices", [])
                 if choices:
                     content = choices[0].get("delta", {}).get("content", "")
                 
-                # Format OpenAI Chunk
                 if content:
                     chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
@@ -335,7 +337,6 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         return StreamingResponse(openai_stream(), media_type="text/event-stream")
     
-    # Non-stream handling (Fake it by consuming stream)
     full_text = ""
     async for chunk in openai_stream():
         if "[DONE]" in chunk: break
