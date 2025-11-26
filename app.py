@@ -289,8 +289,10 @@ async def list_models():
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
     session = session_manager.get_session()
+    request_id = str(uuid.uuid4())[:8] # ID ngắn để trace log
     
-    # Cấu hình giả lập giống file gốc
+    logger.info(f"[{request_id}] 🚀 New Chat Request. Model: {req.model}")
+
     headers = {
         "Authorization": f"Bearer {session['token']}",
         "User-Agent": session['user_agent'],
@@ -298,11 +300,9 @@ async def chat_completions(req: ChatCompletionRequest):
         "X-App-Version": "20240125.0",
         "Accept": "*/*"
     }
-    
-    # Chọn impersonate giống file gốc (Quan trọng!)
     IMPERSONATE = "safari15_3"
 
-    # 1. PoW & Challenge
+    # --- 1. PoW & Challenge ---
     try:
         pow_req = requests.post(
             "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
@@ -314,6 +314,7 @@ async def chat_completions(req: ChatCompletionRequest):
         if pow_req.status_code == 200:
             c_data = pow_req.json().get("data", {}).get("biz_data", {}).get("challenge")
             if c_data:
+                logger.info(f"[{request_id}] 🧩 Solving PoW Challenge...")
                 ans = pow_manager.compute_answer(
                     c_data["challenge"], c_data["salt"], 
                     c_data["difficulty"], c_data["expire_at"]
@@ -329,10 +330,14 @@ async def chat_completions(req: ChatCompletionRequest):
                     }
                     pow_str = base64.b64encode(json.dumps(resp_json).encode()).decode().rstrip()
                     headers["x-ds-pow-response"] = pow_str
+                    logger.info(f"[{request_id}] ✅ PoW Solved.")
+                else:
+                    logger.warning(f"[{request_id}] ⚠️ PoW Solve Failed!")
     except Exception as e:
-        logger.warning(f"PoW warning: {e}")
+        logger.warning(f"[{request_id}] PoW Error: {e}")
 
-    # 2. Tạo Session ID
+    # --- 2. Session ID ---
+    chat_session_id = None
     try:
         s_resp = requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
@@ -340,14 +345,19 @@ async def chat_completions(req: ChatCompletionRequest):
             proxies={"https": Config.PROXY} if Config.PROXY else None,
             timeout=30
         )
-        chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
-    except:
-        chat_session_id = None
+        if s_resp.status_code == 200:
+            chat_session_id = s_resp.json()["data"]["biz_data"]["id"]
+            logger.info(f"[{request_id}] 🆔 Session Created: {chat_session_id}")
+        else:
+            logger.error(f"[{request_id}] ❌ Session Create Failed: {s_resp.text}")
+    except Exception as e:
+        logger.error(f"[{request_id}] Session Create Exception: {e}")
 
-    # 3. Chuẩn bị Payload (Dùng hàm messages_prepare mới)
+    # --- 3. Payload ---
     final_prompt = messages_prepare(req.messages)
-    
-    # Logic bật/tắt thinking giống file gốc
+    # Log 100 ký tự đầu của prompt để debug format
+    logger.info(f"[{request_id}] 📝 Prompt Preview: {final_prompt[:100]}...")
+
     thinking_enabled = False
     if "reasoner" in req.model or "r1" in req.model:
         thinking_enabled = True
@@ -357,34 +367,50 @@ async def chat_completions(req: ChatCompletionRequest):
         "parent_message_id": None,
         "prompt": final_prompt,
         "stream": True,
-        "ref_file_ids": [], # File gốc để mảng rỗng
+        "ref_file_ids": [],
         "thinking_enabled": thinking_enabled,
         "search_enabled": False
     }
 
-    # 4. Request Upstream
+    # --- 4. Request Upstream ---
     try:
+        logger.info(f"[{request_id}] 📡 Sending request to DeepSeek...")
         r = requests.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
             json=payload, headers=headers, impersonate=IMPERSONATE, stream=True,
             proxies={"https": Config.PROXY} if Config.PROXY else None,
             timeout=120
         )
+        logger.info(f"[{request_id}] 🔙 Response Status: {r.status_code}")
+        
+        if r.status_code != 200:
+            logger.error(f"[{request_id}] ❌ Error Body: {r.text}")
+            raise HTTPException(r.status_code, f"Upstream Error: {r.text}")
+
     except Exception as e:
+        logger.error(f"[{request_id}] 💥 Connection Failed: {e}")
         raise HTTPException(502, f"Upstream connect error: {e}")
 
-    # 5. Stream Converter (Quan trọng: Logic parse v/p từ file gốc)
+    # --- 5. Stream Converter (DEBUG MODE) ---
     async def openai_stream():
         chat_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
+        line_count = 0
         
         for line in r.iter_lines():
             if not line: continue
             line = line.decode('utf-8')
+            
+            # LOG 10 dòng đầu tiên để soi dữ liệu
+            line_count += 1
+            if line_count <= 10:
+                logger.info(f"[{request_id}] 📥 Stream Line {line_count}: {line}")
+
             if not line.startswith("data: "): continue
             
             txt = line[6:].strip()
             if txt == "[DONE]":
+                logger.info(f"[{request_id}] ✅ Stream DONE received.")
                 yield "data: [DONE]\n\n"
                 break
             
@@ -392,27 +418,24 @@ async def chat_completions(req: ChatCompletionRequest):
                 chunk = json.loads(txt)
                 content = ""
                 
-                # --- LOGIC PARSE TỪ FILE GỐC ---
-                # Case 1: Chuẩn OpenAI (đôi khi trả về)
+                # Logic Parse
                 if "choices" in chunk:
                     choice = chunk["choices"][0]
                     if choice.get("finish_reason") == "backend_busy":
-                        content = " [Server Busy, try again] "
+                        content = " [Server Busy] "
+                        logger.warning(f"[{request_id}] ⚠️ Server Busy Signal")
                     else:
                         content = choice.get("delta", {}).get("content", "")
                 
-                # Case 2: Chuẩn DeepSeek Web (v, p keys)
                 elif "v" in chunk:
                     v_val = chunk.get("v")
-                    p_val = chunk.get("p") # Path, ví dụ: "response/content" hoặc "response/thinking_content"
-                    
-                    # Chỉ lấy text nếu v là string (nếu v là list thì là status update)
+                    p_val = chunk.get("p")
                     if isinstance(v_val, str):
                         content = v_val
-                        # Nếu là thinking content, có thể format lại để hiển thị
-                        if "thinking" in str(p_val):
-                            content = f"{content}" 
-
+                        # Log nếu nhận được text thật
+                        if line_count <= 20: 
+                             logger.info(f"[{request_id}] 🎯 Parsed Content: {content[:20]}...")
+                
                 if content:
                     resp_chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
@@ -420,14 +443,16 @@ async def chat_completions(req: ChatCompletionRequest):
                         "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(resp_chunk)}\n\n"
+                    
             except Exception as e:
-                # Bỏ qua các line lỗi parse để không ngắt stream
+                logger.error(f"[{request_id}] ⚠️ Parse Error: {e} | Line: {line}")
                 continue
 
     if req.stream:
         return StreamingResponse(openai_stream(), media_type="text/event-stream")
     
     # Non-stream
+    logger.info(f"[{request_id}] ⚠️ Client requested non-stream mode (simulated)")
     full_text = ""
     async for chunk in openai_stream():
         if "[DONE]" in chunk: break
