@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from wasmtime import Linker, Module, Store
 
-# -------------------------- Cấu hình Environment --------------------------
+# -------------------------- Environment Config --------------------------
 load_dotenv()
 
 SERVER_PORT = int(os.getenv("PORT", 5001))
@@ -29,14 +29,20 @@ ACCOUNTS_JSON = os.getenv("DEEPSEEK_ACCOUNTS", "[]")
 try:
     ACCOUNTS_LIST = json.loads(ACCOUNTS_JSON)
 except json.JSONDecodeError:
-    print("Lỗi: DEEPSEEK_ACCOUNTS trong .env không đúng định dạng JSON.")
+    print("Error: DEEPSEEK_ACCOUNTS in .env is not valid JSON.")
     ACCOUNTS_LIST = []
 
 # -------------------------- Logger --------------------------
+# Set level to INFO to reduce noise, formatted for readability
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("DeepSeek-Proxy")
+
+# Reduce curl_cffi log level
+logging.getLogger("curl_cffi").setLevel(logging.WARNING)
 
 app = FastAPI(docs_url=None, redoc_url=None)
 
@@ -50,12 +56,7 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# -------------------------- Helper Token Count --------------------------
-def estimate_tokens(text: str) -> int:
-    if not text: return 0
-    return len(text) // 4
-
-# -------------------------- Quản lý tài khoản --------------------------
+# -------------------------- Account Management --------------------------
 account_queue = []
 
 def init_account_queue():
@@ -66,11 +67,11 @@ def init_account_queue():
             acc["token"] = ""
     account_queue = raw_accounts
     random.shuffle(account_queue)
-    logger.info(f"Đã load {len(account_queue)} tài khoản.")
+    logger.info(f"Loaded {len(account_queue)} accounts from config.")
 
 init_account_queue()
 
-# -------------------------- DeepSeek Constants --------------------------
+# -------------------------- Constants --------------------------
 DEEPSEEK_HOST = "chat.deepseek.com"
 DEEPSEEK_LOGIN_URL = f"https://{DEEPSEEK_HOST}/api/v0/users/login"
 DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/create"
@@ -79,7 +80,7 @@ DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 
 BASE_HEADERS = {
     "Host": DEEPSEEK_HOST,
-    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
@@ -92,9 +93,9 @@ BASE_HEADERS = {
 }
 
 WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm"
-KEEP_ALIVE_TIMEOUT = 5
+KEEP_ALIVE_TIMEOUT = 10
 
-# -------------------------- Auth & Proxy Helpers --------------------------
+# -------------------------- Helpers --------------------------
 def get_proxy_kwargs():
     if PROXY_URL:
         return {"proxies": {"http": PROXY_URL, "https": PROXY_URL}}
@@ -110,12 +111,14 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security
 def get_account_identifier(account):
     return account.get("email", "").strip() or account.get("mobile", "").strip()
 
-# -------------------------- Logic DeepSeek --------------------------
+# -------------------------- Auth Logic --------------------------
 def login_deepseek_via_account(account):
     email = account.get("email", "").strip()
     mobile = account.get("mobile", "").strip()
     password = account.get("password", "").strip()
     
+    logger.info(f"Logging in: {email or mobile}")
+
     if not password or (not email and not mobile):
         raise HTTPException(status_code=400, detail="Account config error in .env")
 
@@ -138,9 +141,10 @@ def login_deepseek_via_account(account):
         data = resp.json()
         new_token = data["data"]["biz_data"]["user"]["token"]
         account["token"] = new_token
+        logger.info("Login successful, token updated.")
         return new_token
     except Exception as e:
-        logger.error(f"[Login] Failed: {e}")
+        logger.error(f"Login failed: {e}")
         raise HTTPException(status_code=500, detail="Login failed upstream")
 
 def get_valid_token(request: Request):
@@ -153,7 +157,7 @@ def get_valid_token(request: Request):
          available_accounts = account_queue
     
     if not available_accounts:
-        raise HTTPException(status_code=429, detail="No accounts configured.")
+        raise HTTPException(status_code=429, detail="No accounts available.")
 
     account = available_accounts[0]
     request.state.account = account
@@ -167,7 +171,7 @@ def get_valid_token(request: Request):
 def get_auth_headers(token):
     return {**BASE_HEADERS, "authorization": f"Bearer {token}"}
 
-# -------------------------- PoW Calculation --------------------------
+# -------------------------- PoW & Session --------------------------
 def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, signature, target_path, wasm_path):
     if algorithm != "DeepSeekHashV1": return None
     prefix = f"{salt}_{expire_at}_"
@@ -175,7 +179,9 @@ def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, si
     linker = Linker(store.engine)
     try:
         with open(wasm_path, "rb") as f: wasm_bytes = f.read()
-    except: return None
+    except FileNotFoundError:
+        logger.error(f"WASM file not found at: {wasm_path}")
+        return None
         
     module = Module(store.engine, wasm_bytes)
     instance = linker.instantiate(store, module)
@@ -210,7 +216,7 @@ def compute_pow_answer(algorithm, challenge_str, salt, difficulty, expire_at, si
 
 def get_pow_response(token):
     headers = get_auth_headers(token)
-    for _ in range(3):
+    for i in range(3):
         try:
             resp = requests.post(
                 DEEPSEEK_CREATE_POW_URL, headers=headers, json={"target_path": "/api/v0/chat/completion"},
@@ -229,156 +235,174 @@ def get_pow_response(token):
                         "answer": ans, "signature": c["signature"], "target_path": c["target_path"]
                     }
                     return base64.b64encode(json.dumps(pow_data, separators=(",", ":"), ensure_ascii=False).encode()).decode().rstrip()
-        except: time.sleep(1)
+        except Exception:
+            time.sleep(1)
     return None
 
 def create_session(token):
     headers = get_auth_headers(token)
-    for _ in range(3):
+    for i in range(3):
         try:
             resp = requests.post(
                 DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={"agent": "chat"},
                 impersonate="safari15_3", **get_proxy_kwargs()
             )
-            if resp.json().get("code") == 0: return resp.json()["data"]["biz_data"]["id"]
-        except: time.sleep(1)
+            if resp.json().get("code") == 0: 
+                return resp.json()["data"]["biz_data"]["id"]
+        except Exception:
+            time.sleep(1)
     return None
 
 def messages_prepare(messages: list) -> str:
-    processed = []
+    """
+    Merges System Prompt into the first User message to avoid 422 errors.
+    Formats the conversation using DeepSeek's internal delimiters.
+    """
+    system_prompts = []
+    conversation = []
+
     for m in messages:
         role = m.get("role", "")
         content = m.get("content", "")
+        
         if isinstance(content, list):
-            text = "\n".join([item.get("text", "") for item in content if item.get("type") == "text"])
+            text_parts = [str(item.get("text", "")) for item in content if item.get("type") == "text"]
+            text = "\n".join(text_parts)
         else:
             text = str(content)
-        processed.append({"role": role, "text": text})
-
-    if not processed: return ""
-    
-    merged = [processed[0]]
-    for msg in processed[1:]:
-        if msg["role"] == merged[-1]["role"]:
-            merged[-1]["text"] += "\n\n" + msg["text"]
-        else:
-            merged.append(msg)
             
+        if role == "system":
+            system_prompts.append(text)
+        else:
+            conversation.append({"role": role, "text": text})
+
+    if system_prompts:
+        system_text = "\n\n".join(system_prompts)
+        if conversation:
+            conversation[0]["text"] = f"{system_text}\n\n{conversation[0]["text"]}"
+        else:
+            conversation.append({"role": "user", "text": system_text})
+
     parts = []
-    for idx, block in enumerate(merged):
+    for idx, block in enumerate(conversation):
         role = block["role"]
         text = block["text"]
+        
         if role == "assistant":
             parts.append(f"<｜Assistant｜>{text}<｜end of sentence｜>")
-        elif role in ("user", "system"):
+        elif role == "user":
             if idx > 0:
                 parts.append(f"<｜User｜>{text}")
             else:
-                parts.append(text)
+                parts.append(text) # First message (with system prompt) has no tag
         else:
             parts.append(text)
             
     final = "".join(parts)
     return re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
 
-# -------------------------- Streaming Logic (Advanced Dynamic Parser) --------------------------
+# -------------------------- Streaming Logic --------------------------
 def sse_generator(response, model, chat_id, created, thinking_enabled):
     last_send = time.time()
     result_queue = queue.Queue()
     
-    # State mapping để biết fragment index nào là THINK, index nào là RESPONSE
-    # Mặc định: fragment 0 thường là text, nhưng nếu có think thì fragment 0 là think, fragment 1 là response.
-    # Ta sẽ auto-detect dựa vào "type" trong packet khai báo fragment.
+    # Track the type of each fragment: 'THINK' or 'RESPONSE'
+    # Default is RESPONSE (text)
     fragment_type_map = {} 
+    current_fragment_id = None
 
     def reader():
         try:
             for line in response.iter_lines():
                 if not line: continue
                 line = line.decode('utf-8')
+                
+                # Ignore events that are not data (like 'event: update_session')
+                if line.startswith("event:"): continue
                 if not line.startswith("data:"): continue
                 
                 data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    result_queue.put("DONE")
-                    break
                 
+                # Handle stream end markers
+                if data_str == "[DONE]" or data_str == "":
+                    continue
+
                 try:
                     chunk = json.loads(data_str)
-                    if "v" not in chunk: continue
-                    val = chunk["v"]
-
-                    # ---------------------------------------------------------
-                    # 1. Packet quản lý Fragments (Khai báo hoặc Append)
-                    # ---------------------------------------------------------
-                    if isinstance(val, list):
-                        for item in val:
-                            # 1.1 Check Finish
-                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                result_queue.put("DONE")
-                                return
-                            
-                            # 1.2 Khai báo Fragment Mới (Dựa vào p="response/fragments" hoặc p="fragments")
-                            # DeepSeek gửi: {"v": [{"id": 1, "type": "THINK", ...}], "p": "fragments", "o": "APPEND"}
-                            # Hoặc: {"v": [{"id": 2, "type": "RESPONSE", ...}], "p": "response/fragments", "o": "APPEND"}
-                            p = item.get("p", "")
-                            if (p == "fragments" or p == "response/fragments") and isinstance(item.get("v"), list):
-                                for fragment in item["v"]:
-                                    # Lấy ID của fragment (trong mảng fragments, id này thường là 1, 2...)
-                                    # Nhưng DeepSeek truy cập theo index mảng (0, 1).
-                                    # Ta cần map index hiện tại của fragment list với Type.
-                                    frag_type = fragment.get("type", "RESPONSE") # THINK hoặc RESPONSE
-                                    
-                                    # Hack: Đếm số lượng key trong map để đoán index mới
-                                    # Nếu đây là fragment đầu tiên -> index 0
-                                    # Nếu đã có 1 fragment -> index 1
-                                    new_index = len(fragment_type_map)
-                                    fragment_type_map[str(new_index)] = frag_type
-                                    
-                                    # Nếu có content ngay trong khai báo (thường là chữ cái đầu tiên)
-                                    if "content" in fragment:
-                                        msg_type = "thinking" if frag_type == "THINK" else "text"
-                                        result_queue.put({"type": msg_type, "content": fragment["content"]})
-                            
-                            # 1.3 Trường hợp fragment lồng trong list cha (dạng cũ)
-                            if p == "fragments" and isinstance(item.get("v"), list):
-                                for fragment in item["v"]:
-                                    if "content" in fragment:
-                                        # Fallback: Nếu chưa map được type thì đoán dựa vào content hoặc mặc định text
-                                        result_queue.put({"type": "text", "content": fragment["content"]})
+                    
+                    # Case 0: Update Session / Title (Ignore)
+                    if "updated_at" in chunk or "click_behavior" in chunk:
                         continue
 
-                    # ---------------------------------------------------------
-                    # 2. Packet nội dung (String) - Append vào fragment cụ thể
-                    # ---------------------------------------------------------
-                    if isinstance(val, str):
-                        p = chunk.get("p", "") # Ví dụ: "response/fragments/0/content"
-                        content = val
+                    # Case 1: Simple content stream (Found in your logs: {"v": "..."})
+                    # This is usually text content for the current active fragment
+                    if "v" in chunk and "p" not in chunk and isinstance(chunk["v"], str):
+                        content = chunk["v"]
+                        # Determine type based on last known fragment or default to text
+                        # If we haven't seen a fragment definition yet, it's likely text.
+                        msg_type = "text"
+                        if current_fragment_id and fragment_type_map.get(str(current_fragment_id)) == "THINK":
+                            msg_type = "thinking"
+                        
+                        result_queue.put({"type": msg_type, "content": content})
+                        continue
 
-                        # Parse path để lấy index: "response/fragments/0/content" -> index = "0"
-                        match = re.search(r"fragments/(\d+)/content", p)
-                        if match:
-                            idx = match.group(1)
-                            frag_type = fragment_type_map.get(idx, "RESPONSE") # Default RESPONSE if unknown
-                            
-                            msg_type = "thinking" if frag_type == "THINK" else "text"
-                            result_queue.put({"type": msg_type, "content": content})
+                    # Case 2: Complex Batch/Update
+                    if "v" in chunk:
+                        val = chunk["v"]
+                        p = chunk.get("p", "")
+
+                        # 2a. Status check
+                        if isinstance(val, list):
+                            for item in val:
+                                if item.get("p") == "status" and item.get("v") == "FINISHED":
+                                    result_queue.put("DONE")
+                                    return
+                                
+                                # 2b. Fragment Definition (Start of Think or Response)
+                                sub_p = item.get("p", "")
+                                if (sub_p == "fragments" or sub_p == "response/fragments") and isinstance(item.get("v"), list):
+                                    for fragment in item["v"]:
+                                        f_id = fragment.get("id")
+                                        f_type = fragment.get("type", "RESPONSE") # THINK or RESPONSE
+                                        
+                                        # Map ID to Type
+                                        if f_id is not None:
+                                            fragment_type_map[str(f_id)] = f_type
+                                            current_fragment_id = f_id # Set active fragment
+                                        
+                                        # If content exists immediately
+                                        if "content" in fragment:
+                                            msg_type = "thinking" if f_type == "THINK" else "text"
+                                            result_queue.put({"type": msg_type, "content": fragment["content"]})
                         
-                        # Fallback cho path cũ hoặc không có path (mặc định text)
-                        elif p == "response/content" or p is None:
-                             result_queue.put({"type": "text", "content": content})
-                        
-                        # Ignore other paths like "response/search_status"
-                except Exception as e:
+                        # 2c. String append via Path (e.g., "response/fragments/-1/content")
+                        elif isinstance(val, str):
+                            # Try to extract fragment ID from path
+                            match = re.search(r"fragments/(\d+)/content", p)
+                            if match:
+                                f_id = match.group(1)
+                                f_type = fragment_type_map.get(f_id, "RESPONSE")
+                                msg_type = "thinking" if f_type == "THINK" else "text"
+                                result_queue.put({"type": msg_type, "content": val})
+                            else:
+                                # Fallback: Assume it belongs to the current active fragment or is text
+                                result_queue.put({"type": "text", "content": val})
+
+                except json.JSONDecodeError:
                     continue
+                except Exception:
+                    continue
+                    
         except Exception as e:
-            logger.error(f"Stream reader error: {e}")
+            logger.error(f"Stream Reader Error: {e}")
             result_queue.put("DONE")
         finally:
             response.close()
 
     threading.Thread(target=reader, daemon=True).start()
 
+    # Initial Chunk
     yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
     while True:
@@ -428,25 +452,34 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         stream = req.get("stream", False)
 
         model_lower = model.lower()
-        # Auto detect thinking/search based on model name OR explicit param
         thinking = req.get("thinking_enabled", False) or ("reasoner" in model_lower or "r1" in model_lower)
         search = req.get("search_enabled", False) or ("search" in model_lower)
+
+        logger.info(f"New Request | Model: {model} | Stream: {stream} | Thinking: {thinking}")
+
+        prompt_content = messages_prepare(messages)
+        if not prompt_content or not prompt_content.strip():
+            logger.warning("Empty prompt received.")
+            return JSONResponse(status_code=400, content={"error": "Message content cannot be empty."})
 
         token = get_valid_token(request)
         session_id = create_session(token)
         pow_resp = get_pow_response(token)
         
         if not session_id or not pow_resp:
+            logger.error("Auth failed (Session/PoW).")
             raise HTTPException(status_code=500, detail="DeepSeek auth failed")
 
+        # Use current date for client_stream_id
+        current_date = time.strftime('%Y%m%d')
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
-            "prompt": messages_prepare(messages),
+            "prompt": prompt_content,
             "ref_file_ids": [],
             "thinking_enabled": thinking,
             "search_enabled": search,
-            "client_stream_id": f"20251126-{uuid.uuid4().hex[:16]}"
+            "client_stream_id": f"{current_date}-{uuid.uuid4().hex[:16]}"
         }
         headers = {**get_auth_headers(token), "x-ds-pow-response": pow_resp}
 
@@ -456,7 +489,9 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         )
         
         if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Upstream Error: {resp.text}")
+            error_text = resp.text
+            logger.error(f"Upstream Error: {resp.status_code} | Body: {error_text}")
+            raise HTTPException(status_code=502, detail=f"Upstream Error: {resp.status_code}")
 
         chat_id = f"chatcmpl-{session_id}"
         created = int(time.time())
@@ -464,12 +499,12 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if stream:
             return StreamingResponse(sse_generator(resp, model, chat_id, created, thinking), media_type="text/event-stream")
         
-        # Non-stream handling (Simplified logic, can be improved similarly to sse_generator if needed)
-        # For full support, client should use stream=True
-        return JSONResponse(status_code=400, content={"error": "Please use stream=true for full DeepSeek R1/Search support"})
+        return JSONResponse(status_code=400, content={"error": "Please use stream=true"})
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        logger.error(f"Chat Error: {e}")
+        logger.exception(f"Internal Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
