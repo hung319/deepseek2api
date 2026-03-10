@@ -516,6 +516,14 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         val = chunk["v"]
                         p = chunk.get("p", "")
 
+                        # Early check: Direct status change like {"p":"response/status","o":"SET","v":"FINISHED"}
+                        if p == "response/status" and val == "FINISHED":
+                            logger.debug(
+                                "Direct status FINISHED received, sending DONE signal"
+                            )
+                            result_queue.put("DONE")
+                            return
+
                         # 2a. Status check
                         if isinstance(val, list):
                             for item in val:
