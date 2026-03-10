@@ -35,7 +35,7 @@ except json.JSONDecodeError:
 # -------------------------- Logger --------------------------
 # Set level to INFO to reduce noise, formatted for readability
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -366,6 +366,7 @@ def messages_prepare(messages: list) -> str:
 
 # -------------------------- Streaming Logic --------------------------
 def sse_generator(response, model, chat_id, created, thinking_enabled):
+    logger.debug(f"SSE Generator initiated | Model: {model} | Chat ID: {chat_id}")
     last_send = time.time()
     result_queue = queue.Queue()
 
@@ -375,29 +376,41 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     current_fragment_id = None
 
     def reader():
+        logger.debug("Starting response reader thread...")
         try:
-            for line in response.iter_lines():
+            for line_num, line in enumerate(response.iter_lines()):
                 if not line:
                     continue
                 line = line.decode("utf-8")
+                logger.debug(
+                    f"Processing line {line_num}: {line[:100]}..."
+                )  # First 100 chars only
 
                 # Ignore events that are not data (like 'event: update_session')
                 if line.startswith("event:"):
+                    logger.debug(f"Ignoring event line: {line}")
                     continue
                 if not line.startswith("data:"):
+                    logger.debug(f"Ignoring non-data line: {line}")
                     continue
 
                 data_str = line[5:].strip()
+                logger.debug(
+                    f"Parsed data string: {data_str[:100]}..."
+                )  # First 100 chars only
 
                 # Handle stream end markers
                 if data_str == "[DONE]" or data_str == "":
+                    logger.debug("Received DONE marker, continuing...")
                     continue
 
                 try:
                     chunk = json.loads(data_str)
+                    logger.debug(f"Parsed JSON chunk: {chunk}")
 
                     # Case 0: Update Session / Title (Ignore)
                     if "updated_at" in chunk or "click_behavior" in chunk:
+                        logger.debug(f"Ignoring update chunk: {chunk}")
                         continue
 
                     # Case 1: Simple content stream (Found in your logs: {"v": "..."})
@@ -558,6 +571,8 @@ async def list_models(api_key: str = Depends(verify_api_key)):
 async def chat_completions(request: Request, api_key: str = Depends(verify_api_key)):
     try:
         req = await request.json()
+        logger.debug(f"Full request body: {req}")
+
         model = req.get("model", "deepseek-chat")
         messages = req.get("messages", [])
         stream = req.get("stream", False)
@@ -571,20 +586,33 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         logger.info(
             f"New Request | Model: {model} | Stream: {stream} | Thinking: {thinking}"
         )
+        logger.debug(f"Request messages: {messages}")
 
         prompt_content = messages_prepare(messages)
+        logger.debug(f"Prepared prompt content: {repr(prompt_content)}")
+
         if not prompt_content or not prompt_content.strip():
             logger.warning("Empty prompt received.")
             return JSONResponse(
                 status_code=400, content={"error": "Message content cannot be empty."}
             )
 
+        logger.debug("Getting valid token...")
         token = get_valid_token(request)
+        logger.debug(f"Token retrieved: {'Yes' if token else 'No'}")
+
+        logger.debug("Creating session...")
         session_id = create_session(token)
+        logger.debug(f"Session ID: {session_id}")
+
+        logger.debug("Getting PoW response...")
         pow_resp = get_pow_response(token)
+        logger.debug(f"PoW response: {pow_resp}")
 
         if not session_id or not pow_resp:
-            logger.error("Auth failed (Session/PoW).")
+            logger.error(
+                f"Auth failed (Session/PoW). Session ID: {session_id}, PoW: {pow_resp}"
+            )
             raise HTTPException(status_code=500, detail="DeepSeek auth failed")
 
         # Use current date for client_stream_id
@@ -599,6 +627,8 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
             "client_stream_id": f"{current_date}-{uuid.uuid4().hex[:16]}",
         }
         headers = {**get_auth_headers(token), "x-ds-pow-response": pow_resp}
+        logger.debug(f"Upstream request headers: {headers}")
+        logger.debug(f"Upstream request payload: {payload}")
 
         resp = requests.post(
             DEEPSEEK_COMPLETION_URL,
@@ -609,6 +639,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
             **get_proxy_kwargs(),
         )
 
+        logger.debug(f"Upstream response status: {resp.status_code}")
         if resp.status_code != 200:
             error_text = resp.text
             logger.error(f"Upstream Error: {resp.status_code} | Body: {error_text}")
