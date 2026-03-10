@@ -246,20 +246,33 @@ def compute_pow_answer(
 
 
 def get_pow_response(token):
+    logger.debug(f"Getting PoW response with token: {token[:10]}...")
     headers = get_auth_headers(token)
+    logger.debug(f"PoW request headers: {headers}")
+
     for i in range(3):
+        logger.debug(f"PoW creation attempt {i + 1}/3")
         try:
+            payload = {"target_path": "/api/v0/chat/completion"}
+            logger.debug(f"PoW request payload: {payload}")
             resp = requests.post(
                 DEEPSEEK_CREATE_POW_URL,
                 headers=headers,
-                json={"target_path": "/api/v0/chat/completion"},
+                json=payload,
                 timeout=30,
                 impersonate="safari15_3",
                 **get_proxy_kwargs(),
             )
+            logger.debug(f"PoW response status: {resp.status_code}")
+            logger.debug(f"PoW raw response: {resp.text[:200]}...")
+
             data = resp.json()
+            logger.debug(f"PoW response JSON: {data}")
+
             if data.get("code") == 0:
                 c = data["data"]["biz_data"]["challenge"]
+                logger.debug(f"PoW challenge received: {c}")
+
                 ans = compute_pow_answer(
                     c["algorithm"],
                     c["challenge"],
@@ -270,6 +283,8 @@ def get_pow_response(token):
                     c["target_path"],
                     WASM_PATH,
                 )
+                logger.debug(f"PoW answer computed: {ans}")
+
                 if ans:
                     pow_data = {
                         "algorithm": c["algorithm"],
@@ -279,7 +294,9 @@ def get_pow_response(token):
                         "signature": c["signature"],
                         "target_path": c["target_path"],
                     }
-                    return (
+                    logger.debug(f"PoW data to encode: {pow_data}")
+
+                    encoded_pow = (
                         base64.b64encode(
                             json.dumps(
                                 pow_data, separators=(",", ":"), ensure_ascii=False
@@ -288,14 +305,31 @@ def get_pow_response(token):
                         .decode()
                         .rstrip()
                     )
-        except Exception:
+                    logger.debug(
+                        f"PoW response encoded successfully: {encoded_pow[:50]}..."
+                    )
+                    return encoded_pow
+                else:
+                    logger.warning(f"PoW answer computation failed")
+            else:
+                logger.warning(
+                    f"PoW request failed with code: {data.get('code')}, message: {data.get('msg')}"
+                )
+        except Exception as e:
+            logger.error(f"PoW attempt {i + 1} failed with error: {e}")
             time.sleep(1)
+
+    logger.error("All PoW attempts failed")
     return None
 
 
 def create_session(token):
+    logger.debug(f"Creating session with token: {token[:10]}...")
     headers = get_auth_headers(token)
+    logger.debug(f"Session request headers: {headers}")
+
     for i in range(3):
+        logger.debug(f"Session creation attempt {i + 1}/3")
         try:
             resp = requests.post(
                 DEEPSEEK_CREATE_SESSION_URL,
@@ -304,10 +338,25 @@ def create_session(token):
                 impersonate="safari15_3",
                 **get_proxy_kwargs(),
             )
-            if resp.json().get("code") == 0:
-                return resp.json()["data"]["biz_data"]["id"]
-        except Exception:
+            logger.debug(f"Session creation response status: {resp.status_code}")
+            logger.debug(f"Session creation response text: {resp.text[:200]}...")
+
+            resp_data = resp.json()
+            logger.debug(f"Session creation response JSON: {resp_data}")
+
+            if resp_data.get("code") == 0:
+                session_id = resp_data["data"]["biz_data"]["id"]
+                logger.debug(f"Session created successfully with ID: {session_id}")
+                return session_id
+            else:
+                logger.warning(
+                    f"Session creation failed with code: {resp_data.get('code')}, message: {resp_data.get('msg')}"
+                )
+        except Exception as e:
+            logger.error(f"Session creation attempt {i + 1} failed with error: {e}")
             time.sleep(1)
+
+    logger.error("All session creation attempts failed")
     return None
 
 
@@ -316,6 +365,7 @@ def messages_prepare(messages: list) -> str:
     Merges System Prompt into the first User message to avoid 422 errors.
     Formats the conversation using DeepSeek's internal delimiters.
     """
+    logger.debug(f"Input messages to prepare: {messages}")
     system_prompts = []
     conversation = []
 
@@ -330,38 +380,65 @@ def messages_prepare(messages: list) -> str:
                 if item.get("type") == "text"
             ]
             text = "\n".join(text_parts)
+            logger.debug(f"Processed list content: {text}")
         else:
             text = str(content)
+            logger.debug(f"Processed string content: {text}")
 
         if role == "system":
             system_prompts.append(text)
+            logger.debug(f"Added system prompt: {text[:50]}...")
         else:
             conversation.append({"role": role, "text": text})
+            logger.debug(f"Added conversation item: {role} - {text[:50]}...")
+
+    logger.debug(f"System prompts collected: {system_prompts}")
+    logger.debug(f"Initial conversation: {conversation}")
 
     if system_prompts:
         system_text = "\n\n".join(system_prompts)
+        logger.debug(f"Merged system text: {system_text[:100]}...")
         if conversation:
+            logger.debug(f"Original first message: {conversation[0]['text'][:100]}...")
             conversation[0]["text"] = f"{system_text}\n\n{conversation[0]['text']}"
+            logger.debug(
+                f"Updated first message with system text: {conversation[0]['text'][:150]}..."
+            )
         else:
             conversation.append({"role": "user", "text": system_text})
+            logger.debug(
+                f"Created first message with system text: {system_text[:100]}..."
+            )
 
     parts = []
     for idx, block in enumerate(conversation):
         role = block["role"]
         text = block["text"]
 
+        logger.debug(f"Processing conversation block {idx}: {role} | {text[:50]}...")
+
         if role == "assistant":
-            parts.append(f"<｜Assistant｜>{text}<｜end of sentence｜>")
+            formatted_text = f"<｜Assistant｜>{text}<｜end of sentence｜>"
+            parts.append(formatted_text)
+            logger.debug(f"Added assistant block: {formatted_text[:70]}...")
         elif role == "user":
             if idx > 0:
-                parts.append(f"<｜User｜>{text}")
+                formatted_text = f"<｜User｜>{text}"
+                parts.append(formatted_text)
+                logger.debug(f"Added user block: {formatted_text[:70]}...")
             else:
                 parts.append(text)  # First message (with system prompt) has no tag
+                logger.debug(f"Added first user block: {text[:70]}...")
         else:
             parts.append(text)
+            logger.debug(f"Added other role block: {role} | {text[:70]}...")
 
     final = "".join(parts)
-    return re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
+    logger.debug(f"Final formatted conversation: {final[:200]}...")
+
+    processed_final = re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final)
+    logger.debug(f"Processed final conversation: {processed_final[:200]}...")
+    return processed_final
 
 
 # -------------------------- Streaming Logic --------------------------
@@ -425,7 +502,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         # If we haven't seen a fragment definition yet, it's likely text.
                         msg_type = "text"
                         if (
-                            current_fragment_id
+                            current_fragment_id is not None
                             and fragment_type_map.get(str(current_fragment_id))
                             == "THINK"
                         ):
@@ -506,24 +583,37 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
         finally:
             response.close()
 
+    logger.debug("Starting SSE reader thread...")
     threading.Thread(target=reader, daemon=True).start()
+    logger.debug("SSE reader thread started successfully")
 
     # Initial Chunk
+    logger.debug("Sending initial assistant role chunk")
     yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
     while True:
         try:
+            logger.debug("Waiting for item from result queue...")
             item = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT)
+            logger.debug(f"Retrieved item from queue: {item}")
+
             if item == "DONE":
+                logger.debug("Received DONE signal, ending stream")
                 yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 break
 
             delta = {}
             if item["type"] == "thinking" and thinking_enabled:
+                logger.debug(f"Processing thinking content: {item['content'][:50]}...")
                 delta["reasoning_content"] = item["content"]
             elif item["type"] == "text":
+                logger.debug(f"Processing text content: {item['content'][:50]}...")
                 delta["content"] = item["content"]
+            else:
+                logger.debug(
+                    f"Processing unknown content type {item['type']}: {item['content'][:50]}..."
+                )
 
             if delta:
                 chunk_data = {
@@ -533,10 +623,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 }
+                logger.debug(f"Yielding chunk data: {chunk_data}")
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 last_send = time.time()
 
         except queue.Empty:
+            logger.debug("Queue empty, sending keep-alive")
             yield ": keep-alive\n\n"
 
 
