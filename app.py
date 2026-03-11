@@ -521,8 +521,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             logger.debug(
                                 "Direct status FINISHED received, sending DONE signal"
                             )
-                            result_queue.put("DONE")
-                            return
+                           result_queue.put("DONE")
+                           # Continue processing - don't return immediately as there may be more content
 
                         # 2a. Status check
                         if isinstance(val, list):
