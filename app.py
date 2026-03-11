@@ -569,8 +569,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                         # 2c. String append via Path (e.g., "response/fragments/-1/content")
                         elif isinstance(val, str):
-                            # Try to extract fragment ID from path
-                            match = re.search(r"fragments/(\d+)/content", p)
+                            # Try to extract fragment ID from path - support both "fragments/x/content" and "response/fragments/x/content"
+                            match = re.search(
+                                r"(?:response/)?fragments/(\d+)/content", p
+                            )
                             if match:
                                 f_id = match.group(1)
                                 f_type = fragment_type_map.get(f_id, "RESPONSE")
