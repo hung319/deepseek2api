@@ -450,12 +450,11 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     # Track the type of each fragment: 'THINK' or 'RESPONSE'
     # Default is RESPONSE (text)
     fragment_type_map = {}
-    current_fragment_id = None
+    current_fragment_id = [None]  # Use list to make it mutable in nested function
 
     def reader():
         logger.debug("Starting response reader thread...")
         try:
-            current_fragment_id = None  # Initialize at the start of the function
             for line_num, line in enumerate(response.iter_lines()):
                 if not line:
                     continue
@@ -503,8 +502,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         # If we haven't seen a fragment definition yet, it's likely text.
                         msg_type = "text"
                         if (
-                            current_fragment_id is not None
-                            and fragment_type_map.get(str(current_fragment_id))
+                            current_fragment_id[0] is not None
+                            and fragment_type_map.get(str(current_fragment_id[0]))
                             == "THINK"
                         ):
                             msg_type = "thinking"
@@ -550,7 +549,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                         # Map ID to Type
                                         if f_id is not None:
                                             fragment_type_map[str(f_id)] = f_type
-                                            current_fragment_id = (
+                                            current_fragment_id[0] = (
                                                 f_id  # Set active fragment
                                             )
 
@@ -579,7 +578,18 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                 result_queue.put({"type": msg_type, "content": val})
                             else:
                                 # Fallback: Assume it belongs to the current active fragment or is text
-                                result_queue.put({"type": "text", "content": val})
+                                if (
+                                    current_fragment_id[0] is not None
+                                    and fragment_type_map.get(
+                                        str(current_fragment_id[0])
+                                    )
+                                    == "THINK"
+                                ):
+                                    result_queue.put(
+                                        {"type": "thinking", "content": val}
+                                    )
+                                else:
+                                    result_queue.put({"type": "text", "content": val})
 
                 except json.JSONDecodeError:
                     continue
