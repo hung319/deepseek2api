@@ -455,6 +455,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     def reader():
         logger.debug("Starting response reader thread...")
         try:
+            current_fragment_id = None  # Initialize at the start of the function
             for line_num, line in enumerate(response.iter_lines()):
                 if not line:
                     continue
@@ -521,8 +522,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             logger.debug(
                                 "Direct status FINISHED received, sending DONE signal"
                             )
-                           result_queue.put("DONE")
-                           # Continue processing - don't return immediately as there may be more content
+                            result_queue.put("DONE")
+                            # Continue processing - don't return immediately as there may be more content
 
                         # 2a. Status check
                         if isinstance(val, list):
