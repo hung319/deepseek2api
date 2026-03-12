@@ -472,18 +472,14 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     continue
 
                 data_str = line[5:].strip()
-                logger.debug(
-                    f"Parsed data string: {data_str[:100]}..."
-                )  # First 100 chars only
 
                 # Handle stream end markers
                 if data_str == "[DONE]" or data_str == "":
-                    logger.debug("Received DONE marker, continuing...")
                     continue
 
                 try:
                     chunk = json.loads(data_str)
-                    logger.debug(f"Parsed JSON chunk: {chunk}")
+                    logger.debug(f"Processing chunk: {chunk}")
 
                     # Case 0: Update Session / Title (Ignore)
                     if "updated_at" in chunk or "click_behavior" in chunk:
@@ -508,6 +504,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         ):
                             msg_type = "thinking"
 
+                        logger.debug(f"Simple content: '{content}' as {msg_type}")
                         result_queue.put({"type": msg_type, "content": content})
                         continue
 
@@ -518,9 +515,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                         # Early check: Direct status change like {"p":"response/status","o":"SET","v":"FINISHED"}
                         if p == "response/status" and val == "FINISHED":
-                            logger.debug(
-                                "Direct status FINISHED received, sending DONE signal"
-                            )
                             result_queue.put("DONE")
                             # Continue processing - don't return immediately as there may be more content
 
@@ -560,6 +554,9 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                                 if f_type == "THINK"
                                                 else "text"
                                             )
+                                            logger.debug(
+                                                f"Fragment content: '{fragment['content']}' as {msg_type}"
+                                            )
                                             result_queue.put(
                                                 {
                                                     "type": msg_type,
@@ -569,7 +566,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                         # 2c. String append via Path (e.g., "response/fragments/-1/content")
                         elif isinstance(val, str):
-                            # Try to extract fragment ID from path - support both "fragments/x/content" and "response/fragments/x/content"
+                            # Try to extract fragment ID from path
                             match = re.search(
                                 r"(?:response/)?fragments/(\d+)/content", p
                             )
@@ -577,21 +574,14 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                 f_id = match.group(1)
                                 f_type = fragment_type_map.get(f_id, "RESPONSE")
                                 msg_type = "thinking" if f_type == "THINK" else "text"
+                                logger.debug(
+                                    f"Path content: '{val}' to fragment {f_id} as {msg_type}"
+                                )
                                 result_queue.put({"type": msg_type, "content": val})
                             else:
                                 # Fallback: Assume it belongs to the current active fragment or is text
-                                if (
-                                    current_fragment_id[0] is not None
-                                    and fragment_type_map.get(
-                                        str(current_fragment_id[0])
-                                    )
-                                    == "THINK"
-                                ):
-                                    result_queue.put(
-                                        {"type": "thinking", "content": val}
-                                    )
-                                else:
-                                    result_queue.put({"type": "text", "content": val})
+                                logger.debug(f"Fallback content: '{val}' as text")
+                                result_queue.put({"type": "text", "content": val})
 
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to decode JSON: {data_str[:100]}...")
@@ -625,27 +615,22 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
     while True:
         try:
-            logger.debug("Waiting for item from result queue...")
             item = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT)
-            logger.debug(f"Retrieved item from queue: {item}")
+            logger.debug(f"Queue item: {item}")
 
             if item == "DONE":
-                logger.debug("Received DONE signal, ending stream")
+                logger.debug("Received DONE signal")
                 yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 break
 
             delta = {}
             if item["type"] == "thinking" and thinking_enabled:
-                logger.debug(f"Processing thinking content: {item['content'][:50]}...")
+                logger.debug(f"Thinking: {item['content'][:30]}...")
                 delta["reasoning_content"] = item["content"]
             elif item["type"] == "text":
-                logger.debug(f"Processing text content: {item['content'][:50]}...")
+                logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
-            else:
-                logger.debug(
-                    f"Processing unknown content type {item['type']}: {item['content'][:50]}..."
-                )
 
             if delta:
                 chunk_data = {
@@ -655,12 +640,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 }
-                logger.debug(f"Yielding chunk data: {chunk_data}")
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 last_send = time.time()
 
         except queue.Empty:
-            logger.debug("Queue empty, sending keep-alive")
             yield ": keep-alive\n\n"
 
 
