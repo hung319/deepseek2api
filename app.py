@@ -482,6 +482,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     chunk = json.loads(data_str)
                     logger.debug(f"Processing chunk: {chunk}")
 
+                    if not isinstance(chunk, dict):
+                        logger.debug(
+                            "Ignoring non-dict chunk: %s", type(chunk).__name__
+                        )
+                        continue
+
                     # Case 0: Update Session / Title (Ignore)
                     if "updated_at" in chunk or "click_behavior" in chunk:
                         logger.debug(f"Ignoring update chunk: {chunk}")
