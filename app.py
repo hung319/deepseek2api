@@ -598,8 +598,21 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                 result_queue.put({"type": msg_type, "content": val})
                             else:
                                 # Fallback: Assume it belongs to the current active fragment or is text
-                                logger.debug(f"Fallback content: '{val}' as text")
-                                result_queue.put({"type": "text", "content": val})
+                                # Check if we should use the current active fragment's type
+                                if (
+                                    current_fragment_id[0] is not None
+                                    and fragment_type_map.get(
+                                        str(current_fragment_id[0])
+                                    )
+                                    == "THINK"
+                                ):
+                                    logger.debug(f"Fallback thinking content: '{val}'")
+                                    result_queue.put(
+                                        {"type": "thinking", "content": val}
+                                    )
+                                else:
+                                    logger.debug(f"Fallback text content: '{val}'")
+                                    result_queue.put({"type": "text", "content": val})
 
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to decode JSON: {data_str[:100]}...")
@@ -645,7 +658,9 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             delta = {}
             if item["type"] == "thinking" and thinking_enabled:
                 logger.debug(f"Thinking: {item['content'][:30]}...")
+                # Add thinking content as a separate field, not mixed with text content
                 delta["reasoning_content"] = item["content"]
+                # Don't set regular content when it's thinking
             elif item["type"] == "text":
                 logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
