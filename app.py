@@ -447,9 +447,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     last_send = time.time()
     result_queue = queue.Queue()
 
-    # Track the type of each fragment: 'THINK' or 'RESPONSE'
+    # Track the type of each fragment: 'THINK', 'RESPONSE', or 'SEARCH'
     # Default is RESPONSE (text)
     fragment_type_map = {}
+    fragment_meta = {}
     current_fragment_id = [None]  # Use list to make it mutable in nested function
 
     def reader():
@@ -518,7 +519,33 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             result_queue.put("DONE")
                             # Continue processing - don't return immediately as there may be more content
 
-                        # 2a. Fragment list payload (e.g., {"p":"response/fragments","o":"APPEND","v":[...]})
+                        # 2a. Search results payload (e.g., response/fragments/-1/results)
+                        search_results_match = re.search(
+                            r"(?:response/)?fragments/(-?\d+)/results", p
+                        )
+                        if search_results_match and isinstance(val, list):
+                            f_id = search_results_match.group(1)
+                            if f_id.startswith("-") and f_id.lstrip("-").isdigit():
+                                actual_f_id = (
+                                    str(current_fragment_id[0])
+                                    if current_fragment_id[0] is not None
+                                    else None
+                                )
+                            else:
+                                actual_f_id = f_id
+
+                            meta = fragment_meta.get(actual_f_id or "", {})
+                            if meta.get("type") == "SEARCH" or actual_f_id is not None:
+                                result_queue.put(
+                                    {
+                                        "type": "search",
+                                        "results": val,
+                                        "queries": meta.get("queries", []),
+                                    }
+                                )
+                            continue
+
+                        # 2b. Fragment list payload (e.g., {"p":"response/fragments","o":"APPEND","v":[...]})
                         if isinstance(val, list) and p in {
                             "response/fragments",
                             "fragments",
@@ -529,6 +556,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                                 if f_id is not None:
                                     fragment_type_map[str(f_id)] = f_type
+                                    fragment_meta[str(f_id)] = {
+                                        "type": f_type,
+                                        "queries": fragment.get("queries", []),
+                                    }
                                     current_fragment_id[0] = f_id
 
                                 if "content" in fragment:
@@ -546,7 +577,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     )
                             continue
 
-                        # 2b. Status check
+                        # 2c. Status check
                         if isinstance(val, list):
                             for item in val:
                                 if (
@@ -556,7 +587,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     result_queue.put("DONE")
                                     return
 
-                                # 2c. Fragment Definition (Start of Think or Response)
+                                # 2d. Fragment Definition (Start of Think or Response)
                                 sub_p = item.get("p", "")
                                 if (
                                     sub_p == "fragments"
@@ -571,6 +602,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                         # Map ID to Type
                                         if f_id is not None:
                                             fragment_type_map[str(f_id)] = f_type
+                                            fragment_meta[str(f_id)] = {
+                                                "type": f_type,
+                                                "queries": fragment.get("queries", []),
+                                            }
                                             current_fragment_id[0] = (
                                                 f_id  # Set active fragment
                                             )
@@ -592,7 +627,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                                 }
                                             )
 
-                        # 2d. String append via Path (e.g., "response/fragments/-1/content")
+                        # 2e. String append via Path (e.g., "response/fragments/-1/content")
                         elif isinstance(val, str):
                             # Try to extract fragment ID from path
                             match = re.search(
@@ -692,6 +727,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             elif item["type"] == "text":
                 logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
+            elif item["type"] == "search":
+                results = item.get("results", [])
+                delta["search_results"] = results
+                queries = item.get("queries")
+                if queries:
+                    delta["search_queries"] = queries
 
             if delta:
                 chunk_data = {
@@ -726,6 +767,18 @@ async def list_models(api_key: str = Depends(verify_api_key)):
                 },
                 {
                     "id": "deepseek-reasoner",
+                    "object": "model",
+                    "created": t,
+                    "owned_by": "deepseek",
+                },
+                {
+                    "id": "deepseek-chat-search",
+                    "object": "model",
+                    "created": t,
+                    "owned_by": "deepseek",
+                },
+                {
+                    "id": "deepseek-reasoner-search",
                     "object": "model",
                     "created": t,
                     "owned_by": "deepseek",
