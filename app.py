@@ -568,14 +568,32 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         elif isinstance(val, str):
                             # Try to extract fragment ID from path
                             match = re.search(
-                                r"(?:response/)?fragments/(\d+)/content", p
+                                r"(?:response/)?fragments/(-?\d+)/content", p
                             )
                             if match:
                                 f_id = match.group(1)
-                                f_type = fragment_type_map.get(f_id, "RESPONSE")
+                                # Handle special indices like -1 (last fragment)
+                                if f_id.startswith("-") and f_id.lstrip("-").isdigit():
+                                    # This is an index like -1, -2, etc.
+                                    # For now, we'll handle -1 specifically as last fragment by using current_fragment_id
+                                    # A more complete solution would maintain the list of fragment IDs
+                                    actual_f_id = (
+                                        str(current_fragment_id[0])
+                                        if current_fragment_id[0] is not None
+                                        else None
+                                    )
+                                else:
+                                    # Regular fragment ID
+                                    actual_f_id = f_id
+
+                                f_type = (
+                                    fragment_type_map.get(actual_f_id, "RESPONSE")
+                                    if actual_f_id is not None
+                                    else "RESPONSE"
+                                )
                                 msg_type = "thinking" if f_type == "THINK" else "text"
                                 logger.debug(
-                                    f"Path content: '{val}' to fragment {f_id} as {msg_type}"
+                                    f"Path content: '{val}' to fragment {actual_f_id or f_id} as {msg_type}"
                                 )
                                 result_queue.put({"type": msg_type, "content": val})
                             else:
