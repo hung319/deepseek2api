@@ -455,14 +455,22 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
     def reader():
         logger.debug("Starting response reader thread...")
+        line_count = 0
+        chunk_count = 0
+        text_chars = 0
         try:
             for line_num, line in enumerate(response.iter_lines()):
                 if not line:
                     continue
                 line = line.decode("utf-8")
-                logger.debug(
-                    f"Processing line {line_num}: {line[:100]}..."
-                )  # First 100 chars only
+                line_count += 1
+                if line_count % 200 == 0:
+                    logger.debug(
+                        "Stream progress: lines=%d chunks=%d text_chars=%d",
+                        line_count,
+                        chunk_count,
+                        text_chars,
+                    )
 
                 # Ignore events that are not data (like 'event: update_session')
                 if line.startswith("event:"):
@@ -480,7 +488,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                 try:
                     chunk = json.loads(data_str)
-                    logger.debug(f"Processing chunk: {chunk}")
+                    chunk_count += 1
 
                     if not isinstance(chunk, dict):
                         logger.debug(
@@ -512,6 +520,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             msg_type = "thinking"
 
                         logger.debug(f"Simple content: '{content}' as {msg_type}")
+                        text_chars += len(content)
                         result_queue.put({"type": msg_type, "content": content})
                         continue
 
@@ -702,7 +711,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     result_queue.put({"type": "text", "content": val})
 
                 except json.JSONDecodeError:
-                    logger.warning(f"Failed to decode JSON: {data_str[:100]}...")
+                    logger.error(
+                        "Failed to decode JSON chunk: %s",
+                        data_str[:200],
+                    )
                     continue
                 except Exception as e:
                     logger.error(
@@ -721,6 +733,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             logger.error(f"Stream Reader Error: {e}")
             result_queue.put("DONE")
         finally:
+            logger.debug(
+                "Stream reader summary: lines=%d chunks=%d text_chars=%d",
+                line_count,
+                chunk_count,
+                text_chars,
+            )
             response.close()
 
     logger.debug("Starting SSE reader thread...")
