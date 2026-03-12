@@ -772,6 +772,79 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             yield ": keep-alive\n\n"
 
 
+def collect_stream_response(response, model, chat_id, created, thinking_enabled):
+    content_parts = []
+    reasoning_parts = []
+    search_results = []
+    search_queries = []
+
+    for chunk in sse_generator(response, model, chat_id, created, thinking_enabled):
+        if chunk.startswith(":"):
+            continue
+
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                return JSONResponse(
+                    content={
+                        "id": chat_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "".join(content_parts),
+                                    **(
+                                        {"reasoning_content": "".join(reasoning_parts)}
+                                        if reasoning_parts
+                                        else {}
+                                    ),
+                                    **(
+                                        {"search_results": search_results}
+                                        if search_results
+                                        else {}
+                                    ),
+                                    **(
+                                        {"search_queries": search_queries}
+                                        if search_queries
+                                        else {}
+                                    ),
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta") or {}
+            if "content" in delta and delta["content"] is not None:
+                content_parts.append(delta["content"])
+            if "reasoning_content" in delta and delta["reasoning_content"] is not None:
+                reasoning_parts.append(delta["reasoning_content"])
+            if "search_results" in delta:
+                search_results = delta.get("search_results") or []
+            if "search_queries" in delta:
+                search_queries = delta.get("search_queries") or []
+
+    return JSONResponse(status_code=504, content={"error": "Stream did not finish"})
+
+
 # -------------------------- Endpoints --------------------------
 
 
@@ -900,9 +973,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                 media_type="text/event-stream",
             )
 
-        return JSONResponse(
-            status_code=400, content={"error": "Please use stream=true"}
-        )
+        return collect_stream_response(resp, model, chat_id, created, thinking)
 
     except HTTPException as e:
         raise e
