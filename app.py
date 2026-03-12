@@ -518,7 +518,35 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             result_queue.put("DONE")
                             # Continue processing - don't return immediately as there may be more content
 
-                        # 2a. Status check
+                        # 2a. Fragment list payload (e.g., {"p":"response/fragments","o":"APPEND","v":[...]})
+                        if isinstance(val, list) and p in {
+                            "response/fragments",
+                            "fragments",
+                        }:
+                            for fragment in val:
+                                f_id = fragment.get("id")
+                                f_type = fragment.get("type", "RESPONSE")
+
+                                if f_id is not None:
+                                    fragment_type_map[str(f_id)] = f_type
+                                    current_fragment_id[0] = f_id
+
+                                if "content" in fragment:
+                                    msg_type = (
+                                        "thinking" if f_type == "THINK" else "text"
+                                    )
+                                    logger.debug(
+                                        f"Fragment content: '{fragment['content']}' as {msg_type}"
+                                    )
+                                    result_queue.put(
+                                        {
+                                            "type": msg_type,
+                                            "content": fragment["content"],
+                                        }
+                                    )
+                            continue
+
+                        # 2b. Status check
                         if isinstance(val, list):
                             for item in val:
                                 if (
@@ -528,7 +556,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     result_queue.put("DONE")
                                     return
 
-                                # 2b. Fragment Definition (Start of Think or Response)
+                                # 2c. Fragment Definition (Start of Think or Response)
                                 sub_p = item.get("p", "")
                                 if (
                                     sub_p == "fragments"
@@ -564,7 +592,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                                 }
                                             )
 
-                        # 2c. String append via Path (e.g., "response/fragments/-1/content")
+                        # 2d. String append via Path (e.g., "response/fragments/-1/content")
                         elif isinstance(val, str):
                             # Try to extract fragment ID from path
                             match = re.search(
