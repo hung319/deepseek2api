@@ -577,6 +577,24 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     )
                             continue
 
+                        # 2b.1 Unhandled fragment payloads (debug)
+                        if "fragments/" in p and not re.search(
+                            r"(?:response/)?fragments/(-?\d+)/(content|results)",
+                            p,
+                        ):
+                            if isinstance(val, dict):
+                                logger.debug(
+                                    "Unhandled fragment payload: %s keys=%s",
+                                    p,
+                                    list(val.keys()),
+                                )
+                            else:
+                                logger.debug(
+                                    "Unhandled fragment payload: %s type=%s",
+                                    p,
+                                    type(val).__name__,
+                                )
+
                         # 2c. Status check
                         if isinstance(val, list):
                             for item in val:
@@ -733,6 +751,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                 queries = item.get("queries")
                 if queries:
                     delta["search_queries"] = queries
+                if "content" not in delta:
+                    delta["content"] = ""
 
             if delta:
                 chunk_data = {
