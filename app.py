@@ -594,8 +594,19 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     result_queue.put({"type": "text", "content": val})
 
                 except json.JSONDecodeError:
+                    logger.warning(f"Failed to decode JSON: {data_str[:100]}...")
                     continue
-                except Exception:
+                except Exception as e:
+                    logger.error(
+                        f"Error processing chunk: {e}, data: {data_str[:100]}..."
+                    )
+                    # Try to salvage content if possible
+                    try:
+                        chunk = json.loads(data_str)
+                        if "v" in chunk and isinstance(chunk["v"], str):
+                            result_queue.put({"type": "text", "content": chunk["v"]})
+                    except:
+                        pass  # If we can't recover, continue
                     continue
 
         except Exception as e:
