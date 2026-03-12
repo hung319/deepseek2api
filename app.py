@@ -737,11 +737,14 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                 break
 
             delta = {}
-            if item["type"] == "thinking" and thinking_enabled:
+            if item["type"] == "thinking":
                 logger.debug(f"Thinking: {item['content'][:30]}...")
-                # Add thinking content as a separate field, not mixed with text content
-                delta["reasoning_content"] = item["content"]
-                # Don't set regular content when it's thinking
+                if thinking_enabled:
+                    # Add thinking content as a separate field, not mixed with text content
+                    delta["reasoning_content"] = item["content"]
+                else:
+                    # Fallback to normal content when thinking is not enabled
+                    delta["content"] = item["content"]
             elif item["type"] == "text":
                 logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
