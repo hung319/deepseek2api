@@ -453,6 +453,13 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     fragment_meta = {}
     current_fragment_id = [None]  # Use list to make it mutable in nested function
 
+    def normalize_references(refs):
+        if refs is None:
+            return []
+        if isinstance(refs, list):
+            return refs
+        return [refs]
+
     def reader():
         logger.debug("Starting response reader thread...")
         line_count = 0
@@ -549,13 +556,50 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             else:
                                 actual_f_id = f_id
 
-                            meta = fragment_meta.get(actual_f_id or "", {})
+                            meta_key = actual_f_id or ""
+                            meta = fragment_meta.get(meta_key, {})
+                            meta["results"] = val
+                            fragment_meta[meta_key] = meta
                             if meta.get("type") == "SEARCH" or actual_f_id is not None:
                                 result_queue.put(
                                     {
                                         "type": "search",
                                         "results": val,
                                         "queries": meta.get("queries", []),
+                                        "references": meta.get("references", []),
+                                    }
+                                )
+                            continue
+
+                        # 2a.1 Search references payload (e.g., response/fragments/-1/references)
+                        search_refs_match = re.search(
+                            r"(?:response/)?fragments/(-?\d+)/(references|sources)",
+                            p,
+                        )
+                        if search_refs_match:
+                            f_id = search_refs_match.group(1)
+                            if f_id.startswith("-") and f_id.lstrip("-").isdigit():
+                                actual_f_id = (
+                                    str(current_fragment_id[0])
+                                    if current_fragment_id[0] is not None
+                                    else None
+                                )
+                            else:
+                                actual_f_id = f_id
+
+                            refs = normalize_references(val)
+
+                            meta_key = actual_f_id or ""
+                            meta = fragment_meta.get(meta_key, {})
+                            meta["references"] = refs
+                            fragment_meta[meta_key] = meta
+                            if meta.get("type") == "SEARCH" or actual_f_id is not None:
+                                result_queue.put(
+                                    {
+                                        "type": "search",
+                                        "results": meta.get("results", []),
+                                        "queries": meta.get("queries", []),
+                                        "references": refs,
                                     }
                                 )
                             continue
@@ -574,6 +618,9 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     fragment_meta[str(f_id)] = {
                                         "type": f_type,
                                         "queries": fragment.get("queries", []),
+                                        "references": normalize_references(
+                                            fragment.get("references")
+                                        ),
                                     }
                                     current_fragment_id[0] = f_id
 
@@ -638,6 +685,9 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                             fragment_meta[str(f_id)] = {
                                                 "type": f_type,
                                                 "queries": fragment.get("queries", []),
+                                                "references": normalize_references(
+                                                    fragment.get("references")
+                                                ),
                                             }
                                             current_fragment_id[0] = (
                                                 f_id  # Set active fragment
@@ -778,6 +828,9 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                 queries = item.get("queries")
                 if queries:
                     delta["search_queries"] = queries
+                references = item.get("references")
+                if references:
+                    delta["search_references"] = references
                 if "content" not in delta:
                     delta["content"] = ""
 
@@ -801,6 +854,7 @@ def collect_stream_response(response, model, chat_id, created, thinking_enabled)
     reasoning_parts = []
     search_results = []
     search_queries = []
+    search_references = []
 
     for chunk in sse_generator(response, model, chat_id, created, thinking_enabled):
         if chunk.startswith(":"):
@@ -840,6 +894,11 @@ def collect_stream_response(response, model, chat_id, created, thinking_enabled)
                                         if search_queries
                                         else {}
                                     ),
+                                    **(
+                                        {"search_references": search_references}
+                                        if search_references
+                                        else {}
+                                    ),
                                 },
                                 "finish_reason": "stop",
                             }
@@ -865,6 +924,8 @@ def collect_stream_response(response, model, chat_id, created, thinking_enabled)
                 search_results = delta.get("search_results") or []
             if "search_queries" in delta:
                 search_queries = delta.get("search_queries") or []
+            if "search_references" in delta:
+                search_references = delta.get("search_references") or []
 
     return JSONResponse(status_code=504, content={"error": "Stream did not finish"})
 
