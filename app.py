@@ -452,6 +452,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
     fragment_type_map = {}
     fragment_meta = {}
     current_fragment_id = [None]  # Use list to make it mutable in nested function
+    citation_indices = set()
+    latest_references = []
 
     def normalize_references(refs):
         if refs is None:
@@ -459,6 +461,50 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
         if isinstance(refs, list):
             return refs
         return [refs]
+
+    def should_skip_text(text):
+        return text in {"FINISHED", "SEARCH", "FINISHEDSEARCH"}
+
+    def strip_citations(text):
+        if not text:
+            return text
+        matches = re.findall(r"\[citation:(\d+)\]", text)
+        for m in matches:
+            try:
+                citation_indices.add(int(m))
+            except ValueError:
+                continue
+        return re.sub(r"\[citation:\d+\]", "", text)
+
+    def format_reference(ref):
+        if isinstance(ref, dict):
+            title = ref.get("title") or ref.get("name") or ref.get("source") or ""
+            url = ref.get("url") or ref.get("link") or ""
+            snippet = ref.get("snippet") or ref.get("text") or ""
+            parts = [p for p in [title, url, snippet] if p]
+            return " - ".join(parts) if parts else str(ref)
+        return str(ref)
+
+    def build_references_text():
+        if not citation_indices and not latest_references:
+            return ""
+        lines = ["", "References:"]
+        if latest_references:
+            if citation_indices:
+                for idx in sorted(citation_indices):
+                    if 1 <= idx <= len(latest_references):
+                        lines.append(
+                            f"- [{idx}] {format_reference(latest_references[idx - 1])}"
+                        )
+                    else:
+                        lines.append(f"- [{idx}]")
+            else:
+                for i, ref in enumerate(latest_references, start=1):
+                    lines.append(f"- [{i}] {format_reference(ref)}")
+        else:
+            for idx in sorted(citation_indices):
+                lines.append(f"- [{idx}]")
+        return "\n".join(lines)
 
     def reader():
         logger.debug("Starting response reader thread...")
@@ -518,6 +564,11 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         content = chunk["v"]
                         if content is None:
                             continue
+                        if should_skip_text(content):
+                            continue
+                        content = strip_citations(content)
+                        if content == "":
+                            continue
                         # Determine type based on last known fragment or default to text
                         # If we haven't seen a fragment definition yet, it's likely text.
                         msg_type = "text"
@@ -561,6 +612,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             meta = fragment_meta.get(meta_key, {})
                             meta["results"] = val
                             fragment_meta[meta_key] = meta
+                            latest_references = meta.get("references", [])
                             if meta.get("type") == "SEARCH" or actual_f_id is not None:
                                 result_queue.put(
                                     {
@@ -594,6 +646,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             meta = fragment_meta.get(meta_key, {})
                             meta["references"] = refs
                             fragment_meta[meta_key] = meta
+                            latest_references = refs
                             if meta.get("type") == "SEARCH" or actual_f_id is not None:
                                 result_queue.put(
                                     {
@@ -629,16 +682,22 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     "content" in fragment
                                     and fragment["content"] is not None
                                 ):
+                                    content = fragment["content"]
+                                    if should_skip_text(content):
+                                        continue
+                                    content = strip_citations(content)
+                                    if content == "":
+                                        continue
                                     msg_type = (
                                         "thinking" if f_type == "THINK" else "text"
                                     )
                                     logger.debug(
-                                        f"Fragment content: '{fragment['content']}' as {msg_type}"
+                                        f"Fragment content: '{content}' as {msg_type}"
                                     )
                                     result_queue.put(
                                         {
                                             "type": msg_type,
-                                            "content": fragment["content"],
+                                            "content": content,
                                         }
                                     )
                             continue
@@ -702,18 +761,24 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                             "content" in fragment
                                             and fragment["content"] is not None
                                         ):
+                                            content = fragment["content"]
+                                            if should_skip_text(content):
+                                                continue
+                                            content = strip_citations(content)
+                                            if content == "":
+                                                continue
                                             msg_type = (
                                                 "thinking"
                                                 if f_type == "THINK"
                                                 else "text"
                                             )
                                             logger.debug(
-                                                f"Fragment content: '{fragment['content']}' as {msg_type}"
+                                                f"Fragment content: '{content}' as {msg_type}"
                                             )
                                             result_queue.put(
                                                 {
                                                     "type": msg_type,
-                                                    "content": fragment["content"],
+                                                    "content": content,
                                                 }
                                             )
 
@@ -745,6 +810,11 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     else "RESPONSE"
                                 )
                                 if val is not None:
+                                    if should_skip_text(val):
+                                        continue
+                                    val = strip_citations(val)
+                                    if val == "":
+                                        continue
                                     msg_type = (
                                         "thinking" if f_type == "THINK" else "text"
                                     )
@@ -756,6 +826,11 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                 # Fallback: Assume it belongs to the current active fragment or is text
                                 # Check if we should use the current active fragment's type
                                 if val is not None:
+                                    if should_skip_text(val):
+                                        continue
+                                    val = strip_citations(val)
+                                    if val == "":
+                                        continue
                                     if (
                                         current_fragment_id[0] is not None
                                         and fragment_type_map.get(
@@ -821,6 +896,22 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
             if item == "DONE":
                 logger.debug("Received DONE signal")
+                references_text = build_references_text()
+                if references_text:
+                    chunk_data = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": references_text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
                 yield f"data: {json.dumps({'id': chat_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 break
