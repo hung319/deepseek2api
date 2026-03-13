@@ -35,7 +35,7 @@ except json.JSONDecodeError:
 # -------------------------- Logger --------------------------
 # Set level to INFO to reduce noise, formatted for readability
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -468,6 +468,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
         refs = []
         for item in results:
             if isinstance(item, dict):
+                nested_refs = normalize_references(
+                    item.get("references") or item.get("sources")
+                )
+                if nested_refs:
+                    refs.extend(nested_refs)
+                    continue
                 ref = {}
                 title = (
                     item.get("title")
@@ -475,8 +481,19 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     or item.get("source")
                     or item.get("site_name")
                 )
-                url = item.get("url") or item.get("link")
-                snippet = item.get("snippet") or item.get("text") or item.get("content")
+                url = (
+                    item.get("url")
+                    or item.get("link")
+                    or item.get("source_url")
+                    or item.get("sourceUrl")
+                    or item.get("display_url")
+                )
+                snippet = (
+                    item.get("snippet")
+                    or item.get("text")
+                    or item.get("content")
+                    or item.get("summary")
+                )
                 if title:
                     ref["title"] = title
                 if url:
@@ -617,8 +634,22 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         search_results_match = re.search(
                             r"(?:response/)?fragments/(-?\d+)/results", p
                         )
+                        if not search_results_match:
+                            search_results_match = re.search(
+                                r"^(?:response/)?(search_results|results)$", p
+                            )
                         if search_results_match and isinstance(val, list):
-                            f_id = search_results_match.group(1)
+                            if (
+                                search_results_match.lastindex == 1
+                                and search_results_match.group(1)
+                                in {
+                                    "search_results",
+                                    "results",
+                                }
+                            ):
+                                f_id = None
+                            else:
+                                f_id = search_results_match.group(1)
                             if f_id.startswith("-") and f_id.lstrip("-").isdigit():
                                 actual_f_id = (
                                     str(current_fragment_id[0])
@@ -945,7 +976,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                 if queries:
                     delta["search_queries"] = queries
                 references = item.get("references")
+                if not references:
+                    references = extract_references_from_results(results)
                 if references:
+                    latest_references = references
                     delta["search_references"] = references
                 if "content" not in delta:
                     delta["content"] = ""
