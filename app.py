@@ -443,7 +443,7 @@ def messages_prepare(messages: list) -> str:
 
 # -------------------------- Streaming Logic --------------------------
 def sse_generator(response, model, chat_id, created, thinking_enabled):
-    logger.debug(f"SSE Generator initiated | Model: {model} | Chat ID: {chat_id}")
+    logger.info(f"SSE Generator initiated | Model: {model} | Chat ID: {chat_id}")
     last_send = time.time()
     result_queue = queue.Queue()
 
@@ -461,6 +461,32 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
         if isinstance(refs, list):
             return refs
         return [refs]
+
+    def extract_references_from_results(results):
+        if not isinstance(results, list):
+            return []
+        refs = []
+        for item in results:
+            if isinstance(item, dict):
+                ref = {}
+                title = (
+                    item.get("title")
+                    or item.get("name")
+                    or item.get("source")
+                    or item.get("site_name")
+                )
+                url = item.get("url") or item.get("link")
+                snippet = item.get("snippet") or item.get("text") or item.get("content")
+                if title:
+                    ref["title"] = title
+                if url:
+                    ref["url"] = url
+                if snippet:
+                    ref["snippet"] = snippet
+                refs.append(ref if ref else item)
+            else:
+                refs.append(item)
+        return refs
 
     def should_skip_text(text):
         return text in {"FINISHED", "SEARCH", "FINISHEDSEARCH"}
@@ -507,7 +533,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
         return "\n".join(lines)
 
     def reader():
-        logger.debug("Starting response reader thread...")
+        logger.info("Starting response reader thread...")
         line_count = 0
         chunk_count = 0
         text_chars = 0
@@ -518,7 +544,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                 line = line.decode("utf-8")
                 line_count += 1
                 if line_count % 200 == 0:
-                    logger.debug(
+                    logger.info(
                         "Stream progress: lines=%d chunks=%d text_chars=%d",
                         line_count,
                         chunk_count,
@@ -527,10 +553,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
                 # Ignore events that are not data (like 'event: update_session')
                 if line.startswith("event:"):
-                    logger.debug(f"Ignoring event line: {line}")
                     continue
                 if not line.startswith("data:"):
-                    logger.debug(f"Ignoring non-data line: {line}")
                     continue
 
                 data_str = line[5:].strip()
@@ -544,14 +568,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     chunk_count += 1
 
                     if not isinstance(chunk, dict):
-                        logger.debug(
-                            "Ignoring non-dict chunk: %s", type(chunk).__name__
-                        )
                         continue
 
                     # Case 0: Update Session / Title (Ignore)
                     if "updated_at" in chunk or "click_behavior" in chunk:
-                        logger.debug(f"Ignoring update chunk: {chunk}")
                         continue
 
                     # Case 1: Simple content stream (Found in your logs: {"v": "..."})
@@ -612,6 +632,12 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                             meta = fragment_meta.get(meta_key, {})
                             meta["results"] = val
                             fragment_meta[meta_key] = meta
+                            derived_refs = meta.get(
+                                "references"
+                            ) or extract_references_from_results(val)
+                            if derived_refs and not meta.get("references"):
+                                meta["references"] = derived_refs
+                                fragment_meta[meta_key] = meta
                             latest_references = meta.get("references", [])
                             if meta.get("type") == "SEARCH" or actual_f_id is not None:
                                 result_queue.put(
@@ -691,9 +717,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     msg_type = (
                                         "thinking" if f_type == "THINK" else "text"
                                     )
-                                    logger.debug(
-                                        f"Fragment content: '{content}' as {msg_type}"
-                                    )
                                     result_queue.put(
                                         {
                                             "type": msg_type,
@@ -772,9 +795,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                                 if f_type == "THINK"
                                                 else "text"
                                             )
-                                            logger.debug(
-                                                f"Fragment content: '{content}' as {msg_type}"
-                                            )
                                             result_queue.put(
                                                 {
                                                     "type": msg_type,
@@ -818,9 +838,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     msg_type = (
                                         "thinking" if f_type == "THINK" else "text"
                                     )
-                                    logger.debug(
-                                        f"Path content: '{val}' to fragment {actual_f_id or f_id} as {msg_type}"
-                                    )
                                     result_queue.put({"type": msg_type, "content": val})
                             else:
                                 # Fallback: Assume it belongs to the current active fragment or is text
@@ -838,14 +855,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                         )
                                         == "THINK"
                                     ):
-                                        logger.debug(
-                                            f"Fallback thinking content: '{val}'"
-                                        )
                                         result_queue.put(
                                             {"type": "thinking", "content": val}
                                         )
                                     else:
-                                        logger.debug(f"Fallback text content: '{val}'")
                                         result_queue.put(
                                             {"type": "text", "content": val}
                                         )
@@ -873,7 +886,7 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             logger.error(f"Stream Reader Error: {e}")
             result_queue.put("DONE")
         finally:
-            logger.debug(
+            logger.info(
                 "Stream reader summary: lines=%d chunks=%d text_chars=%d",
                 line_count,
                 chunk_count,
@@ -881,21 +894,18 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             )
             response.close()
 
-    logger.debug("Starting SSE reader thread...")
+    logger.info("Starting SSE reader thread...")
     threading.Thread(target=reader, daemon=True).start()
-    logger.debug("SSE reader thread started successfully")
+    logger.info("SSE reader thread started successfully")
 
     # Initial Chunk
-    logger.debug("Sending initial assistant role chunk")
     yield f"data: {json.dumps({'id': chat_id, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
     while True:
         try:
             item = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT)
-            logger.debug(f"Queue item: {item}")
-
             if item == "DONE":
-                logger.debug("Received DONE signal")
+                logger.info("Received DONE signal")
                 references_text = build_references_text()
                 if references_text:
                     chunk_data = {
@@ -918,7 +928,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
 
             delta = {}
             if item["type"] == "thinking":
-                logger.debug(f"Thinking: {item['content'][:30]}...")
                 if thinking_enabled:
                     # Add thinking content as a separate field, not mixed with text content
                     delta["reasoning_content"] = item["content"]
@@ -928,7 +937,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
             elif item["type"] == "text":
                 if item["content"] is None:
                     continue
-                logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
             elif item["type"] == "search":
                 results = item.get("results", [])
