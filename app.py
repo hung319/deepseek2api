@@ -516,6 +516,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         and isinstance(chunk["v"], str)
                     ):
                         content = chunk["v"]
+                        if content is None:
+                            continue
                         # Determine type based on last known fragment or default to text
                         # If we haven't seen a fragment definition yet, it's likely text.
                         msg_type = "text"
@@ -623,7 +625,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     }
                                     current_fragment_id[0] = f_id
 
-                                if "content" in fragment:
+                                if (
+                                    "content" in fragment
+                                    and fragment["content"] is not None
+                                ):
                                     msg_type = (
                                         "thinking" if f_type == "THINK" else "text"
                                     )
@@ -693,7 +698,10 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                             )
 
                                         # If content exists immediately
-                                        if "content" in fragment:
+                                        if (
+                                            "content" in fragment
+                                            and fragment["content"] is not None
+                                        ):
                                             msg_type = (
                                                 "thinking"
                                                 if f_type == "THINK"
@@ -736,28 +744,36 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                                     if actual_f_id is not None
                                     else "RESPONSE"
                                 )
-                                msg_type = "thinking" if f_type == "THINK" else "text"
-                                logger.debug(
-                                    f"Path content: '{val}' to fragment {actual_f_id or f_id} as {msg_type}"
-                                )
-                                result_queue.put({"type": msg_type, "content": val})
+                                if val is not None:
+                                    msg_type = (
+                                        "thinking" if f_type == "THINK" else "text"
+                                    )
+                                    logger.debug(
+                                        f"Path content: '{val}' to fragment {actual_f_id or f_id} as {msg_type}"
+                                    )
+                                    result_queue.put({"type": msg_type, "content": val})
                             else:
                                 # Fallback: Assume it belongs to the current active fragment or is text
                                 # Check if we should use the current active fragment's type
-                                if (
-                                    current_fragment_id[0] is not None
-                                    and fragment_type_map.get(
-                                        str(current_fragment_id[0])
-                                    )
-                                    == "THINK"
-                                ):
-                                    logger.debug(f"Fallback thinking content: '{val}'")
-                                    result_queue.put(
-                                        {"type": "thinking", "content": val}
-                                    )
-                                else:
-                                    logger.debug(f"Fallback text content: '{val}'")
-                                    result_queue.put({"type": "text", "content": val})
+                                if val is not None:
+                                    if (
+                                        current_fragment_id[0] is not None
+                                        and fragment_type_map.get(
+                                            str(current_fragment_id[0])
+                                        )
+                                        == "THINK"
+                                    ):
+                                        logger.debug(
+                                            f"Fallback thinking content: '{val}'"
+                                        )
+                                        result_queue.put(
+                                            {"type": "thinking", "content": val}
+                                        )
+                                    else:
+                                        logger.debug(f"Fallback text content: '{val}'")
+                                        result_queue.put(
+                                            {"type": "text", "content": val}
+                                        )
 
                 except json.JSONDecodeError:
                     logger.error(
@@ -819,6 +835,8 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                     # Fallback to normal content when thinking is not enabled
                     delta["content"] = item["content"]
             elif item["type"] == "text":
+                if item["content"] is None:
+                    continue
                 logger.debug(f"Text: {item['content'][:30]}...")
                 delta["content"] = item["content"]
             elif item["type"] == "search":
