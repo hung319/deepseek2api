@@ -526,7 +526,6 @@ def sse_generator(response, model, chat_id, created, thinking_enabled):
                         ):
                             msg_type = "thinking"
 
-                        logger.debug(f"Simple content: '{content}' as {msg_type}")
                         text_chars += len(content)
                         result_queue.put({"type": msg_type, "content": content})
                         continue
